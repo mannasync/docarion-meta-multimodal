@@ -118,7 +118,9 @@ function CareStationPage() {
   const { user } = useAuthStore();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const facilityId = user?.facilityId || 'fac-default';
+  // No fake fallback facility: a station with no facility must not read or
+  // write another tenant's config under a placeholder id.
+  const facilityId = user?.facilityId || '';
   const isSiteAdmin = Boolean(user?.role && SITE_ADMIN_ROLES.has(user.role));
 
   // Mode state
@@ -263,6 +265,8 @@ function CareStationPage() {
     setTerminalMessages([]);
     setTerminalInput('');
     setTerminalStatus('waiting_doctor');
+    // AI differentials / red flags belong to the patient they were generated for.
+    setCopilotData(null);
   };
 
   // Step 1 Handler: Patient Lookup by Phone / Walk-In Account Creation
@@ -431,6 +435,26 @@ function CareStationPage() {
       toast.success('Structured Hx & Vitals saved — Patient cleared for Doctor!');
     } catch (err) {
       toast.error(actionErrorMessage(err, 'Vitals and history were NOT saved. Please try again.'));
+    } finally {
+      setSavingHxVitals(false);
+    }
+  };
+
+  // Kiosk (patient-operated): record booth vitals only. Clearing the patient for
+  // the doctor is a nurse decision, so the kiosk never calls nurseComplete.
+  const handleSaveKioskVitals = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeSession) return;
+    if (!(vitalsForm.bp || vitalsForm.temp || vitalsForm.hr || vitalsForm.spo2 || vitalsForm.weight)) {
+      toast.error('Enter at least one reading.');
+      return;
+    }
+    setSavingHxVitals(true);
+    try {
+      await aiIntakeApi.saveVitals(activeSession.sessionId, vitalsForm);
+      toast.success('Vitals recorded — a nurse will review them shortly.');
+    } catch (err) {
+      toast.error(actionErrorMessage(err, 'Vitals were NOT saved. Please try again.'));
     } finally {
       setSavingHxVitals(false);
     }
@@ -875,7 +899,7 @@ function CareStationPage() {
         setUnlockError('Incorrect Station PIN. Kiosk remains locked.');
         return;
       }
-    } else if (stationConfig.hasStationPin) {
+    } else if (stationConfig.hasStationPin && facilityId) {
       try {
         await adminApi.verifyCareStationPin(facilityId, attempt);
       } catch (error) {
@@ -897,6 +921,10 @@ function CareStationPage() {
   // Site Admin: Save Care Station Configuration
   const handleSaveStationConfig = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!facilityId) {
+      toast.error('This account is not linked to a facility, so station settings cannot be saved.');
+      return;
+    }
     setSavingConfig(true);
     try {
       const pin = (stationConfig.stationPin || '').trim();
@@ -1173,7 +1201,7 @@ function CareStationPage() {
                     <Activity className="w-4 h-4 text-rose-400" />
                     Step 2: Station Booth Vitals
                   </h3>
-                  <form onSubmit={handleSaveStructuredHxAndVitals} className="space-y-3">
+                  <form onSubmit={handleSaveKioskVitals} className="space-y-3">
                     <div>
                       <label className="text-xs text-slate-400">Blood Pressure (mmHg)</label>
                       <input
@@ -1255,13 +1283,8 @@ function CareStationPage() {
                         {terminalDoctorName} · Status: {terminalStatus}
                       </h3>
                     </div>
-                    <Link
-                      href={`/consultations/${activeSession.consultationId}`}
-                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5"
-                    >
-                      <Video className="w-4 h-4" />
-                      Open Full Video Room
-                    </Link>
+                    {/* No link out of the kiosk: navigating to /consultations would
+                        leave the PIN lock and hand the patient the staff session. */}
                   </div>
 
                   <div className="max-h-52 overflow-y-auto space-y-2">
@@ -1303,8 +1326,7 @@ function CareStationPage() {
                     </button>
                   </form>
 
-                  {/* Meta Muse Wonder Co-Pilot Panel */}
-                  {renderCopilotPanel(true)}
+                  {/* The Co-Pilot (DDx / red flags) is clinician-only — never on the patient-facing kiosk. */}
                 </div>
               )}
             </div>

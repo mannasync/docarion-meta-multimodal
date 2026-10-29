@@ -635,6 +635,48 @@ function isAssignedDoctor(user: AuthRequest['user'], entry: any): boolean {
     return !!user && user.role === 'doctor' && !!entry?.assignedDoctorId && entry.assignedDoctorId === user.userId;
 }
 
+/**
+ * Doctor-to-doctor separation. Once a colleague has taken a patient, another
+ * doctor may neither act on that queue entry (complete / release / no-show /
+ * bulk-update) nor read the patient's identity or symptoms from the queue.
+ * Facility scope alone ("same hospital") is not enough — that let Doctor B end
+ * or hand back Doctor A's live consultation. Nurses and administrators keep
+ * their existing facility-scoped queue powers.
+ */
+function isAnotherDoctorsPatient(user: AuthRequest['user'], entry: any): boolean {
+    return !!user && user.role === 'doctor' && !!entry?.assignedDoctorId && entry.assignedDoctorId !== user.userId;
+}
+
+/** Uniform 403 for a doctor acting on a colleague's patient. */
+function denyAnotherDoctorsPatient(res: Response): Response {
+    return res.status(403).json({
+        success: false,
+        error: 'This patient is already with another doctor',
+        code: 'ASSIGNED_TO_ANOTHER_DOCTOR',
+    });
+}
+
+/**
+ * What a doctor sees of a colleague's engaged queue entry: enough for the board
+ * to show "in consultation" and keep counts right — no name, symptoms,
+ * dependent or patient id.
+ */
+function redactForOtherDoctor(entry: any): any {
+    return {
+        queueId: entry.queueId,
+        status: entry.status,
+        facilityId: entry.facilityId ?? null,
+        urgencyLevel: entry.urgencyLevel,
+        triageCategory: entry.triageCategory,
+        joinedAt: entry.joinedAt,
+        assignedAt: entry.assignedAt,
+        assignedDoctorId: entry.assignedDoctorId,
+        patientName: 'Patient in consultation',
+        symptoms: [],
+        redacted: true,
+    };
+}
+
 /** Uniform 403 for a cross-tenant queue mutation. */
 function denyQueueScope(res: Response): Response {
     return res.status(403).json({
@@ -723,29 +765,28 @@ router.get('/queue', authorize(...QUEUE_READ_ROLES), requireCompletedCredential(
         query = query.where('status', 'in', ['waiting', 'assigned', 'in_consultation', 'diagnostics']);
     }
 
-    // If a hybrid doctor ('both' / platformTelehealthAgreement) is polling without an explicit facility filter,
-    // allow them to see both their assigned facilities AND the central platform queue (facilityId == null).
-    if (!isHybridDoctor || req.query.facilityId) {
-        query = applyQueueScope(query, facilityId);
-    }
-
-    const snapshot = await query.orderBy('joinedAt', 'asc').limit(100).get();
+    // A hybrid doctor ('both' / platformTelehealthAgreement) polling without an explicit facility filter
+    // sees the central platform queue AND each allowed facility. Each scope is its own query: a single
+    // unscoped `limit(100)` filtered in memory let other facilities' entries crowd theirs out.
+    const scopes: QueueReadScope[] = isHybridDoctor && !req.query.facilityId
+        ? [CENTRAL_QUEUE, 'DOCARION_PLATFORM', ...Array.from(hybridAllowedFacilities)]
+        : [facilityId];
+    const snapshots = await Promise.all(
+        scopes.map((scope) => applyQueueScope(query, scope).orderBy('joinedAt', 'asc').limit(100).get()),
+    );
+    const seen = new Set<string>();
     const nowMs = Date.now();
-    let entries = snapshot.docs
+    let entries = snapshots
+        .flatMap((snapshot: any) => snapshot.docs)
+        .filter((doc: any) => (seen.has(doc.id) ? false : (seen.add(doc.id), true)))
         .map((doc: any) => {
             const raw = doc.data();
+            if (isAnotherDoctorsPatient(req.user, raw)) return redactForOtherDoctor(raw);
             const presence = computePatientOnlinePresence(raw, nowMs);
             return {
                 ...raw,
                 ...presence,
             };
-        })
-        .filter((e: any) => {
-            if (isHybridDoctor && !req.query.facilityId) {
-                if (!e.facilityId || e.facilityId === 'DOCARION_PLATFORM') return true;
-                return hybridAllowedFacilities.has(e.facilityId);
-            }
-            return true;
         });
 
     if (presenceFilter === 'online') {
@@ -1271,6 +1312,7 @@ router.post('/complete', authorize(...DOCTOR_ROLES), asyncHandler(async (req: Au
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Queue entry not found' });
 
     const entry = doc.data()!;
+    if (isAnotherDoctorsPatient(req.user, entry)) return denyAnotherDoctorsPatient(res);
     if (!canActOnQueueEntry(req.user, entry) && !isAssignedDoctor(req.user, entry)) return denyQueueScope(res);
     if (!['assigned', 'in_consultation'].includes(entry.status)) {
         return res.status(400).json({ success: false, error: `Cannot complete — status is ${entry.status}` });
@@ -1357,12 +1399,17 @@ router.patch('/bulk-update', authorize(...QUEUE_MUTATION_ROLES), asyncHandler(as
     const batch = firestore.batch();
     let updated = 0;
     let skippedOutOfScope = 0;
+    let skippedAssignedElsewhere = 0;
 
     for (const queueId of queueIds.slice(0, 50)) { // Max 50 per batch
         const ref = collections.telehealthQueue.doc(queueId);
         const doc = await ref.get();
         if (doc.exists && !canActOnQueueEntry(req.user, doc.data())) {
             skippedOutOfScope++;
+            continue;
+        }
+        if (doc.exists && isAnotherDoctorsPatient(req.user, doc.data())) {
+            skippedAssignedElsewhere++;
             continue;
         }
         if (doc.exists && ['waiting', 'assigned'].includes(doc.data()!.status)) {
@@ -1381,14 +1428,14 @@ router.patch('/bulk-update', authorize(...QUEUE_MUTATION_ROLES), asyncHandler(as
     await batch.commit();
 
     await logAudit(req, 'QUEUE_BULK_UPDATE', 'telehealthQueue', queueIds.join(','), {
-        details: { status, count: updated, reason, skippedOutOfScope },
+        details: { status, count: updated, reason, skippedOutOfScope, skippedAssignedElsewhere },
         ...(skippedOutOfScope ? { severity: 'warning' as const } : {}),
     });
 
     res.json({
         success: true,
         message: `${updated} queue entries updated to ${status}`,
-        data: { updated, skippedOutOfScope },
+        data: { updated, skippedOutOfScope, skippedAssignedElsewhere },
     });
 }));
 
@@ -1477,6 +1524,7 @@ router.patch('/:queueId/no-show', authorize(...QUEUE_MUTATION_ROLES), asyncHandl
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Queue entry not found' });
 
     const data = doc.data()!;
+    if (isAnotherDoctorsPatient(req.user, data)) return denyAnotherDoctorsPatient(res);
     if (!canActOnQueueEntry(req.user, data)) return denyQueueScope(res); // WALL-GAP-4
     if (!['waiting', 'assigned'].includes(data.status)) {
         return res.status(400).json({ success: false, error: 'Entry is not in an active state' });
@@ -1572,6 +1620,7 @@ router.post('/:queueId/release', authorize(...QUEUE_MUTATION_ROLES), asyncHandle
     }
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Queue entry not found' });
     const data = doc.data()!;
+    if (isAnotherDoctorsPatient(req.user, data)) return denyAnotherDoctorsPatient(res);
     if (!canActOnQueueEntry(req.user, data) && !isAssignedDoctor(req.user, data)) return denyQueueScope(res); // WALL-GAP-4
     if (!['assigned', 'in_consultation'].includes(data.status)) {
         return res.status(409).json({ success: false, error: `Can only return assigned patients (current: ${data.status})` });

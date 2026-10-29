@@ -102,7 +102,14 @@ function PharmacyDashboard() {
     const { summaryText, loading: aiLoading } = usePharmacyAiSummary(stats.pending, stats.lowStock);
 
     useEffect(() => {
-        if (canReview || facilityId) loadData();
+        if (canReview || facilityId) {
+            loadData();
+            return;
+        }
+        // No facility and no platform-review permission: nothing to load, so say
+        // so instead of leaving the skeleton up forever.
+        setError('This account is not linked to a pharmacy or medicine store yet.');
+        setLoading(false);
     }, [facilityId, canReview]);
 
     const loadData = async () => {
@@ -135,10 +142,14 @@ function PharmacyDashboard() {
                 setError(null);
                 return;
             }
-            const [prescRes, walletRes] = await Promise.all([
-                pharmacyApi.getPrescriptions(facilityId),
-                pharmacyApi.getWallet(facilityId),
-            ]);
+            const prescRes = await pharmacyApi.getPrescriptions(facilityId);
+            // Wallet is best-effort: roles without wallet access must still get
+            // their prescription queue rather than the error screen.
+            let earnings = 0;
+            try {
+                const walletRes = await pharmacyApi.getWallet(facilityId);
+                earnings = walletRes.data.data?.balance || 0;
+            } catch { /* no wallet access for this role */ }
 
             const allPrescriptions = prescRes.data.data || [];
             setPrescriptions(allPrescriptions.filter((p: Prescription) =>
@@ -160,7 +171,7 @@ function PharmacyDashboard() {
                     ['sent_to_local_pharmacy', 'preparing', 'ready_for_pickup'].includes(p.workflowStatus || '')
                     || (!p.workflowStatus && p.status === 'active')).length,
                 dispensed: allPrescriptions.filter((p: Prescription) => p.status === 'dispensed').length,
-                earnings: walletRes.data.data?.balance || 0,
+                earnings,
                 lowStock,
                 expiring,
             });
@@ -854,7 +865,7 @@ function PharmacyDashboard() {
                     <div className="lg:col-span-4 space-y-6">
                         <DashboardAIAssistant />
                     </div>
-                    <div className="mt-6">
+                    <div className="lg:col-span-12">
                         <ComplianceBadges />
                     </div>
                 </div>

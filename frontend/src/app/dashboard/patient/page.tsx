@@ -9,7 +9,6 @@ import { RoleNavDrawer } from '@/components/layout/RoleNavDrawer';
 import { withRoleGuard } from '@/components/shared/withRoleGuard';
 import {
   patientApi,
-  doctorApi,
   schedulingApi,
   walletApi,
   aiIntakeApi,
@@ -322,7 +321,6 @@ function PatientDashboard() {
         prescRes,
         labRes,
         careTeamRes,
-        doctorsFallbackRes,
         meRes,
         feedRes,
         shortcutsRes,
@@ -332,7 +330,6 @@ function PatientDashboard() {
         patientApi.getPrescriptions(),
         patientApi.getLabResults(),
         patientApi.getCareTeam(facilityParam),
-        doctorApi.getAll({ limit: 6 }),
         authApi.me(),
         patientApi.getHealthFeed(facilityParam),
         patientApi.getShortcuts(),
@@ -362,7 +359,9 @@ function PatientDashboard() {
           ? allLabs.filter((l: any) => !l.facilityId || l.facilityId === effectiveFacility)
           : allLabs;
 
-      // Care Team resolution: prefer patientApi.getCareTeam(), fallback to doctorApi.getAll()
+      // Care Team = doctors this patient actually has a relationship with. No
+      // fallback to an arbitrary doctor list: showing strangers as "My Care Team"
+      // (with message/schedule buttons) misled patients. The empty state explains it.
       let resolvedCareTeam: CareTeamMember[] = [];
       if (careTeamRes.status === 'fulfilled') {
         const rawTeam = careTeamRes.value.data?.data ?? careTeamRes.value.data;
@@ -391,19 +390,6 @@ function PatientDashboard() {
             lastVisitAt: p.lastVisitAt,
             profile: p.profile,
           }));
-      }
-      if (resolvedCareTeam.length === 0 && doctorsFallbackRes.status === 'fulfilled') {
-        const fallbackList = doctorsFallbackRes.value.data?.data || [];
-        resolvedCareTeam = fallbackList.map((d: any) => ({
-          providerId: d.userId || d.id,
-          userId: d.userId || d.id,
-          name: `Dr. ${d.profile?.lastName || d.profile?.firstName || 'Physician'}`,
-          specialty: d.specialization || 'General Practice',
-          facilityName: d.facilityName || 'Docarion Network',
-          isPrimary: false,
-          isOnline: d.isOnline,
-          profile: d.profile,
-        }));
       }
       setCareTeam(resolvedCareTeam);
 
@@ -607,7 +593,9 @@ function PatientDashboard() {
   };
 
   const handleRequestRefill = async (item: any) => {
-    const prescId = item.prescriptionId || item.id || prescriptions[0]?.prescriptionId;
+    // Never fall back to another prescription: an unmatched suggestion must not
+    // request a refill for whatever happens to be first in the list.
+    const prescId = item.prescriptionId || item.id;
     if (!prescId) {
       router.push('/prescriptions');
       return;

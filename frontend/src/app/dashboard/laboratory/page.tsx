@@ -35,19 +35,17 @@ interface LabOrder {
 }
 
 const calculateTAT = (orders: LabOrder[], priority: string) => {
-    const relevant = orders.filter(o => (o.priority || 'routine').toLowerCase() === priority.toLowerCase() && o.status === 'completed');
-    if (relevant.length === 0) return '0h';
-    let totalMs = 0;
-    relevant.forEach(o => {
-        const start = o.createdAt ? new Date(o.createdAt).getTime() : Date.now();
-        const end = (o as any).completedAt ? new Date((o as any).completedAt).getTime() : Date.now();
-        totalMs += (end - start);
-    });
-    const avgMs = totalMs / relevant.length;
-    const hours = Math.floor(avgMs / (1000 * 60 * 60));
-    const minutes = Math.floor((avgMs % (1000 * 60 * 60)) / (1000 * 60));
-    if (hours > 0) return `${hours}.${Math.round(minutes/6)}h`;
-    return `${minutes}m`;
+    // Only orders with both timestamps count: substituting "now" for a missing
+    // completedAt inflated the average every time the page was opened.
+    const relevant = orders.filter(o =>
+        (o.priority || 'routine').toLowerCase() === priority.toLowerCase()
+        && o.status === 'completed' && o.createdAt && (o as any).completedAt);
+    if (relevant.length === 0) return '—';
+    const totalMs = relevant.reduce(
+        (sum, o) => sum + (new Date((o as any).completedAt).getTime() - new Date(o.createdAt as any).getTime()), 0);
+    const avgMinutes = Math.max(0, totalMs / relevant.length / 60000);
+    if (avgMinutes >= 60) return `${(avgMinutes / 60).toFixed(1)}h`;
+    return `${Math.round(avgMinutes)}m`;
 };
 
 function LaboratoryDashboard() {
@@ -63,7 +61,11 @@ function LaboratoryDashboard() {
     const facilityId = user?.facilityId || '';
 
     const load = useCallback(async () => {
-        if (!facilityId) return;
+        if (!facilityId) {
+            setLoadError('This account is not linked to a laboratory yet.');
+            setLoading(false);
+            return;
+        }
         setLoading(true);
         setLoadError('');
         try {
@@ -75,7 +77,7 @@ function LaboratoryDashboard() {
             setOrders(allOrders);
             setStats({
                 pending: allOrders.filter(o => o.status === 'pending').length,
-                processing: allOrders.filter(o => ['sample_collected', 'processing'].includes(o.status)).length,
+                processing: allOrders.filter(o => ['sample_collected', 'processing', 'awaiting_validation'].includes(o.status)).length,
                 completed: allOrders.filter(o => o.status === 'completed').length,
                 rejected: allOrders.filter(o => o.status === 'sample_rejected').length,
             });

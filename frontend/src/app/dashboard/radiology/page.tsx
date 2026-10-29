@@ -52,7 +52,7 @@ function RadiologyDashboardPage() {
                 isAdmin ? radiologyApi.getTatReport(facilityId).catch(() => null) : Promise.resolve(null),
                 isAdmin ? radiologyApi.getContrastStats(facilityId).catch(() => null) : Promise.resolve(null),
                 radiologyApi.getMwl(facilityId).catch(() => null),
-                radiologyApi.getAiSummary(facilityId).catch(() => null),
+                canViewCenterInsights ? radiologyApi.getAiSummary(facilityId).catch(() => null) : Promise.resolve(null),
             ]);
             if (analyticsRes) setAnalytics(analyticsRes.data.data);
             setOrders(ordersRes.data.data || []);
