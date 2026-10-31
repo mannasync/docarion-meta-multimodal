@@ -247,6 +247,25 @@ describe('aiCoreService provider failover', () => {
         expect(url).toBe('https://inference.baseten.co/v1/chat/completions');
         expect(body.model).toBe('meta-models/muse-spark-open-1026');
         expect(config.headers.Authorization).toBe('Bearer baseten-direct-key');
+        // Baseten hard-rejects `max_completion_tokens` with HTTP 400
+        // ("Extra inputs are not permitted") — it must only ever get `max_tokens`.
+        expect(body).not.toHaveProperty('max_completion_tokens');
+        expect(typeof body.max_tokens).toBe('number');
+    });
+
+    it('sends max_completion_tokens (not max_tokens) only to the direct Meta API', async () => {
+        process.env.LLAMA_API_TOKEN = 'LLM_1234_key';
+        delete process.env.OPENROUTER_API_KEY;
+        delete process.env.GEMINI_API_KEY;
+        mockAxiosPost.mockResolvedValue({ data: { choices: [{ message: { content: '{"ok":true}' } }] } });
+
+        const { aiCoreService } = loadService();
+        await aiCoreService.generateStructured([{ role: 'user', content: 'hi' }], 2000);
+
+        const [url, body] = mockAxiosPost.mock.calls[0];
+        expect(url).toBe('https://api.meta.ai/v1/chat/completions');
+        expect(body.max_completion_tokens).toBe(8000);
+        expect(body).not.toHaveProperty('max_tokens');
     });
 
     it('normalizes meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8 to muse-wonder-1.0 on direct Meta API', async () => {

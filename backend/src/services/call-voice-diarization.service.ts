@@ -29,7 +29,9 @@ export interface DiarizedTurn {
 
 export interface CallDiarizationResult {
     consultationId?: string;
-    model: 'meta-sam-audio-modal-gpu' | 'meta-sam-audio-local-engine';
+    model: 'meta-sam-audio-modal-gpu' | 'meta-sam-audio-local-engine' | 'demo-script (not from this call)';
+    /** True only when the scripted demo was returned (CALL_DIARIZE_DEMO_MODE). */
+    demo?: boolean;
     noiseFiltered: boolean;
     speakersDetected: number;
     turns: DiarizedTurn[];
@@ -61,7 +63,14 @@ export function stripBase64AudioPrefix(base64Str?: string): string {
     return base64Str.replace(/^data:[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+(?:;[a-zA-Z0-9.+-]+=[a-zA-Z0-9.+-]+)*;base64,/, '').trim();
 }
 
-export const DEFAULT_MODAL_DIARIZE_ENDPOINT = 'https://mannasync-cpu--docarion-meta-multimodal-diarize-endpoint.us-east.modal.run';
+// Real MMS-1B app (backend/modal/modal_mms_asr_app.py); requires X-Docarion-Key.
+export const DEFAULT_MODAL_DIARIZE_ENDPOINT = 'https://mannasync-cpu--docarion-mms-asr-api.us-east.modal.run/diarize';
+
+/** Shared secret the Docarion MMS app on Modal requires (header X-Docarion-Key). */
+export function modalAuthHeaders(): Record<string, string> {
+    const key = (process.env.MODAL_ASR_SHARED_SECRET || '').trim();
+    return key ? { 'X-Docarion-Key': key } : {};
+}
 
 export function resolveDiarizeEndpoint(): string {
     const raw = (process.env.MODAL_DIARIZE_ENDPOINT_URL || process.env.MODAL_META_ENDPOINT_URL || DEFAULT_MODAL_DIARIZE_ENDPOINT).trim();
@@ -139,6 +148,44 @@ export function parseCustomDialogue(text: string, defaultLanguage: string = 'eng
     return turns;
 }
 
+/** No speech result could be produced for this audio. */
+export class DiarizationUnavailableError extends Error {
+    code = 'DIARIZATION_UNAVAILABLE';
+    constructor() {
+        super('Speech recognition is not available right now. Type the notes instead.');
+    }
+}
+
+const SYMPTOM_TERMS: Array<[RegExp, string]> = [
+    [/\bfever|body dey hot|temperature\b/i, 'Fever'],
+    [/\bheadache|head dey (?:burst|pain)/i, 'Headache'],
+    [/\bcough/i, 'Cough'],
+    [/\bdiarrh?oea|diarrhea|purg(?:e|ing)|watery stool/i, 'Diarrhoea'],
+    [/\bvomit/i, 'Vomiting'],
+    [/\bchest (?:pain|tightness)/i, 'Chest pain or tightness'],
+    [/\bshort(?:ness)? of breath|breathless|difficulty breathing/i, 'Breathing difficulty'],
+    [/\bchills|rigors|cold dey shake/i, 'Chills'],
+    [/\babdominal pain|stomach pain|belle dey pain/i, 'Abdominal pain'],
+    [/\brash/i, 'Rash'],
+    [/\bdizz/i, 'Dizziness'],
+    [/\bweak(?:ness)?|tired|fatigue/i, 'Weakness or fatigue'],
+];
+const MEDICATION_TERMS = [
+    'paracetamol', 'amoxicillin', 'ciprofloxacin', 'metronidazole', 'artemether', 'lumefantrine', 'coartem',
+    'oral rehydration', 'ors', 'zinc', 'ibuprofen', 'augmentin', 'metformin', 'amlodipine', 'lisinopril',
+    'insulin', 'salbutamol', 'prednisolone', 'tramadol', 'diclofenac', 'cotrimoxazole', 'azithromycin',
+];
+
+/** What the transcript literally mentions (deterministic; no inference). */
+function keywordEntities(text: string): ExtractedEntities {
+    const symptoms = SYMPTOM_TERMS.filter(([re]) => re.test(text)).map(([, label]) => label);
+    const lower = text.toLowerCase();
+    const medications = MEDICATION_TERMS
+        .filter(term => new RegExp(`\\b${term.replace(/\s+/g, '\\s+')}\\b`, 'i').test(lower))
+        .map(name => ({ name: name.replace(/\b\w/g, c => c.toUpperCase()), dosage: '', frequency: '', duration: '' }));
+    return { symptoms, diagnoses: [], medications, procedures: [], followUps: [], historyItems: [], redFlags: [] };
+}
+
 export const callVoiceDiarizationService = {
     /**
      * Segregates two-way call audio into doctor vs patient speech, scrubs PII,
@@ -175,7 +222,7 @@ export const callVoiceDiarizationService = {
                         audio_base64: cleanAudio,
                         language: input.language || 'english',
                         strip_noise: stripNoise,
-                    }, { timeout: 20000 });
+                    }, { timeout: 20000, headers: modalAuthHeaders() });
 
                     if (res.data && Array.isArray(res.data.turns) && res.data.turns.length > 0) {
                         rawTurns = res.data.turns;
@@ -187,10 +234,18 @@ export const callVoiceDiarizationService = {
             }
         }
 
-        // 3. Local Realistic Consultation Engine Fallback (with endemic Pidgin & clinical dialogue)
+        // 3. No real speech result: FAIL. A scripted consultation must never be
+        // returned as if it came from this call (it would end up in a real
+        // patient's record). The scripted demo exists only when explicitly
+        // switched on (CALL_DIARIZE_DEMO_MODE=true) and is labelled as a demo.
+        let demo = false;
         if (rawTurns.length === 0) {
+            if (process.env.CALL_DIARIZE_DEMO_MODE !== 'true') {
+                throw new DiarizationUnavailableError();
+            }
             rawTurns = getSimulatedClinicalTurns(input.language);
             endpointUsed = 'local-engine';
+            demo = true;
         }
 
         // 3. Deterministic Pre-LLM PHI Scrubbing across all turns
@@ -229,13 +284,16 @@ export const callVoiceDiarizationService = {
         } catch (err: any) {
             log.warn(`Call Diarization: Entity extraction fallback (${err?.message})`);
         }
+        // Without the AI extractor, only what the transcript actually says: a
+        // simple keyword match (never canned findings).
         if (!extractedEntities || (extractedEntities.symptoms.length === 0 && extractedEntities.medications.length === 0)) {
-            extractedEntities = getFallbackExtractedEntities();
+            extractedEntities = demo ? getFallbackExtractedEntities() : keywordEntities(fullScrubbedTranscript);
         }
 
         return {
             consultationId: input.consultationId,
-            model: endpointUsed === 'modal-gpu' ? 'meta-sam-audio-modal-gpu' : 'meta-sam-audio-local-engine',
+            ...(demo ? { demo: true } : {}),
+            model: demo ? 'demo-script (not from this call)' : endpointUsed === 'modal-gpu' ? 'meta-sam-audio-modal-gpu' : 'meta-sam-audio-local-engine',
             noiseFiltered: stripNoise,
             speakersDetected: new Set(processedTurns.map(t => t.speaker)).size,
             turns: processedTurns,

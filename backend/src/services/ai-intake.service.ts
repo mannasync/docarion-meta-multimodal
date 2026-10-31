@@ -26,9 +26,18 @@ import {
     resolveTriage,
 } from './intake-history.service';
 import { toMillis } from '../utils/timestamp';
+import { markQueueEntryIntakeComplete } from './queue-entry.service';
+import { GUEST_CALLBACK_ASK } from './emergency-copy';
 import { wrapUntrustedData } from '../utils/ai-safety';
 import { computeAgeFromDob } from '../utils/ai-pseudonymize';
 import { AIPrivacyOptions } from './ai-privacy.service';
+import {
+    resolveIntakeLocationContext,
+    handleEmergencyEscalation,
+    IntakeLocationContext,
+    IntakeEmergencyEscalationRecord,
+} from './intake-emergency.service';
+import { getFirstAidGuidance, CombinedFirstAidGuidance } from './emergency-first-aid';
 
 // ============================================================
 // Doc Arion AI Medical Intake Service
@@ -156,7 +165,7 @@ TIER 2 — CLARIFY FIRST: Nigerian English can sound more dramatic than intended
 - "bleeding" → "Is the bleeding happening now? Can you control it with pressure, or is it soaking through cloths?"
 - "seizure" → "Is someone having a seizure RIGHT NOW, or did it happen earlier?"
 Only set emergencyDetected to true if the patient CONFIRMS it is (a) happening RIGHT NOW and (b) severe.
-WHEN FLAGGING an emergency, respond with: "⚠️ This sounds like it could be a medical emergency. Please call 112 or go to the nearest emergency room IMMEDIATELY. Do not wait for a doctor on this app." (translated into the patient's language), and set category to "emergency".
+WHEN FLAGGING an emergency, respond with: "⚠️ This sounds like it could be a medical emergency. Go to the nearest hospital emergency room IMMEDIATELY. Ask someone to take you — family, a neighbour, or a taxi — and do not drive yourself. Do not wait for a doctor on this app." (translated into the patient's language), and set category to "emergency".
 
 EARLY TRIAGE (WITHIN YOUR FIRST 1-3 QUESTIONS):
 As soon as you know the presenting complaint and have asked 1-2 targeted severity questions, include a provisional "triage" block in your JSON and keep it updated:
@@ -522,6 +531,34 @@ function mergeRedFlags(existing: RedFlagHit[], incoming: RedFlagHit[]): RedFlagH
     return merged.slice(0, 30);
 }
 
+export interface PatientEscalationSummary {
+    status: IntakeEmergencyEscalationRecord['status'];
+    staffAlerted: boolean;
+    doctorAlerted: boolean;
+    followUpTeamAlerted: boolean;
+}
+
+/** What the patient's own screen may know about the escalation. */
+function patientEscalationSummary(record?: IntakeEmergencyEscalationRecord): PatientEscalationSummary | undefined {
+    if (!record) return undefined;
+    return {
+        status: record.status,
+        staffAlerted: !!record.facilityId && (record.notified?.staffRoles?.length || 0) > 0,
+        doctorAlerted: (record.notified?.doctorIds?.length || 0) > 0,
+        followUpTeamAlerted: ((record.notified?.regionalAdminIds?.length || 0) + (record.notified?.centralAdminIds?.length || 0)) > 0,
+    };
+}
+
+/**
+ * An anonymous patient has no account we can reach, so the emergency reply
+ * also asks for contact details (the app shows a short form for them).
+ */
+function withGuestFollowUpAsk(directive: string, guest: boolean): string {
+    if (!guest) return directive;
+    // The short call-back form under the chat holds the fields; the chat only points to it.
+    return `${directive} ${GUEST_CALLBACK_ASK}`;
+}
+
 /** Escalate the consultation record for an emergency (urgency + triage fields). */
 async function escalateConsultation(consultationId: string, redFlags: RedFlagHit[]): Promise<void> {
     try {
@@ -537,6 +574,9 @@ async function escalateConsultation(consultationId: string, redFlags: RedFlagHit
             triageReason: redFlags.filter(f => f.severity === 'immediate').map(f => f.label).join('; ')
                 || 'Emergency confirmed during intake',
         });
+        // An emergency does not wait for the intake to finish: surface the
+        // patient in the doctors' claim queue immediately (emergency band).
+        await markQueueEntryIntakeComplete(consultationId, { emergency: true });
     } catch (e) {
         log.warn('Failed to update emergency status on consultation:', e);
     }
@@ -586,7 +626,14 @@ export async function conductIntake(
     message: string,
     consultationId: string,
     language: string = 'en',
-    options: { guest?: boolean } = {}
+    options: {
+        guest?: boolean;
+        location?: IntakeLocationContext;
+        facilityId?: string | null;
+        isSandbox?: boolean;
+        /** Hashed client address of a guest (anonymous emergency abuse limits). */
+        anonymousClientKey?: string | null;
+    } = {}
 ): Promise<{
     consultationId: string;
     aiResponse: string;
@@ -596,6 +643,17 @@ export async function conductIntake(
     isComplete: boolean;
     emergencyDetected: boolean;
     emergencyInstructions?: string;
+    emergencyDirective?: string;
+    firstAid?: CombinedFirstAidGuidance;
+    /**
+     * Anonymous (guest) emergency: ask the patient for a call-back number,
+     * name, location, whether anyone is with them and whether they can get to
+     * care — sent to POST /ai-intake/guest/:sessionId/emergency-details.
+     */
+    followUpRequested?: boolean;
+    locationContext?: IntakeLocationContext;
+    /** Patient-safe summary only — never responder ids or contact details. */
+    escalation?: PatientEscalationSummary;
     // ── Additive fields (v3 full-history intake) ──
     historyState?: HistoryState;
     completeness?: Completeness;
@@ -638,6 +696,8 @@ export async function conductIntake(
     }
 
     const sanitizedMessage = stripPII(message, knownIdentifiers);
+    const locationContext = options.location
+        || await resolveIntakeLocationContext(consultationId, { facilityId: options.facilityId });
 
     // ── Deterministic context detection (pediatric/obstetric/mental health/chronic + language)
     const detectedFlags = detectContext(sanitizedMessage);
@@ -652,7 +712,8 @@ export async function conductIntake(
     const flagScan = classifyRedFlags(sanitizedMessage);
     if (flagScan.immediate.length > 0) {
         const allFlags = mergeRedFlags(session.redFlags, flagScan.immediate);
-        const directive = emergencyDirective(flagScan.immediate);
+        const directive = withGuestFollowUpAsk(emergencyDirective(flagScan.immediate, locationContext), !!options.guest);
+        const firstAid = getFirstAidGuidance(allFlags.map(f => f.id));
         const emergencyTriage = resolveTriage({ redFlagEmergency: true, previous: session.triage })!;
         const updatedMessages: ChatMessage[] = [
             ...session.messages,
@@ -661,6 +722,24 @@ export async function conductIntake(
         ];
         await saveIntakeSession(consultationId, updatedMessages, session.turnCount + 1, true, session.historyState, allFlags, true, emergencyTriage);
         await escalateConsultation(consultationId, allFlags);
+
+        let escalationRecord: IntakeEmergencyEscalationRecord | undefined;
+        try {
+            escalationRecord = await handleEmergencyEscalation({
+                sessionId: consultationId,
+                consultationId,
+                redFlags: allFlags,
+                locationContext,
+                patientId: session.patientId || null,
+                patientName: identifiedProfile ? `${identifiedProfile.firstName || ''} ${identifiedProfile.lastName || ''}`.trim() : null,
+                isSandbox: options.isSandbox,
+                anonymous: !!options.guest,
+                anonymousClientKey: options.anonymousClientKey || null,
+            });
+        } catch (e) {
+            log.error('Failed to trigger emergency escalation:', e);
+        }
+
         // Generate the brief now so the red flags surface for the physician immediately
         generatePhysicianBrief(consultationId).catch(e => log.error('Background brief gen failed:', e));
 
@@ -682,6 +761,11 @@ export async function conductIntake(
             isComplete: true,
             emergencyDetected: true,
             emergencyInstructions: directive,
+            emergencyDirective: directive,
+            firstAid,
+            followUpRequested: !!options.guest,
+            locationContext,
+            escalation: patientEscalationSummary(escalationRecord),
             historyState: session.historyState,
             completeness: computeCompleteness(session.historyState),
             redFlags: allFlags,
@@ -881,23 +965,53 @@ export async function conductIntake(
 
     // If intake is complete, trigger physician brief generation in background
     if (result.isComplete) {
-        generatePhysicianBrief(consultationId).catch(e => log.error('Background brief gen failed:', e));
+        generatePhysicianBrief(consultationId).catch((e) => {
+            log.error('Background brief gen failed:', e);
+            // Record why, so GET /brief can explain (and lazily retry) instead of a bare 404.
+            collections.consultations.doc(consultationId)
+                .update({ physicianBriefError: e?.message || 'brief generation failed', physicianBriefErrorAt: new Date() })
+                .catch(() => { });
+        });
 
-        // Update consultation status
+        // Update consultation status, then move the queue row from
+        // `intake_pending` to `waiting` so doctors see the patient now (and the
+        // SLA clock starts). Guest sessions have no consultation yet — no-op.
         try {
             await collections.consultations.doc(consultationId).update({
                 intakeCompleted: true,
                 intakeCompletedAt: new Date(),
                 status: 'intake_complete',
             });
+            await markQueueEntryIntakeComplete(consultationId);
         } catch (e) {
             log.warn('Failed to update consultation status:', e);
         }
     }
 
     // If emergency detected (model-confirmed via two-step clarification), escalate
+    let modelEscalationRecord: IntakeEmergencyEscalationRecord | undefined;
+    let modelFirstAid: CombinedFirstAidGuidance | undefined;
+    let modelDirective: string | undefined;
+
     if (result.emergencyDetected) {
         await escalateConsultation(consultationId, redFlags);
+        modelFirstAid = getFirstAidGuidance(redFlags.map(f => f.id));
+        modelDirective = withGuestFollowUpAsk(emergencyDirective(redFlags, locationContext), !!options.guest);
+        try {
+            modelEscalationRecord = await handleEmergencyEscalation({
+                sessionId: consultationId,
+                consultationId,
+                redFlags,
+                locationContext,
+                patientId: session.patientId || null,
+                patientName: identifiedProfile ? `${identifiedProfile.firstName || ''} ${identifiedProfile.lastName || ''}`.trim() : null,
+                isSandbox: options.isSandbox,
+                anonymous: !!options.guest,
+                anonymousClientKey: options.anonymousClientKey || null,
+            });
+        } catch (e) {
+            log.error('Failed to trigger model emergency escalation:', e);
+        }
     }
 
     // Log analytics
@@ -920,13 +1034,18 @@ export async function conductIntake(
 
     return {
         consultationId,
-        aiResponse: result.response,
+        aiResponse: modelDirective && result.emergencyDetected ? modelDirective : result.response,
         questionNumber: result.questionNumber || newTurnCount,
         totalExpected: result.totalExpected || 18,
         category: result.category || 'chief_complaint',
         isComplete: result.isComplete,
         emergencyDetected: result.emergencyDetected || false,
-        emergencyInstructions: result.emergencyInstructions,
+        emergencyInstructions: modelDirective || result.emergencyInstructions,
+        emergencyDirective: modelDirective,
+        firstAid: modelFirstAid,
+        followUpRequested: !!options.guest && !!result.emergencyDetected,
+        locationContext,
+        escalation: patientEscalationSummary(modelEscalationRecord),
         historyState,
         completeness,
         redFlags,
@@ -1099,6 +1218,7 @@ export async function generatePhysicianBrief(consultationId: string): Promise<AI
         await collections.consultations.doc(consultationId).update({
             physicianBrief: wrappedBrief,
             physicianBriefGeneratedAt: new Date(),
+            physicianBriefError: null,
         });
     } catch (e) {
         log.error('Failed to save physician brief:', e);
@@ -1193,16 +1313,113 @@ export async function getIntakeStatus(consultationId: string): Promise<{
 // ============================================================
 // Get Physician Brief
 // ============================================================
-export async function getPhysicianBrief(consultationId: string): Promise<{
-    brief: AIResponseWrapper<PhysicianBrief> | null;
-    transcript: string | null;
-}> {
-    const consultDoc = await collections.consultations.doc(consultationId).get();
-    const intakeDoc = await collections.intakeSessions.doc(consultationId).get();
+export interface PhysicianBriefSafety {
+    risk_level?: string;
+    reasoning_trace?: string;
+    safety_flags?: string[];
+    requires_human_review?: boolean;
+    safety_validated?: boolean;
+    audit_id?: string;
+}
 
+export interface PhysicianBriefResult {
+    /** The brief itself — UNWRAPPED from the AIResponseWrapper so clients read `brief.hpiNarrative` directly. */
+    brief: PhysicianBrief | null;
+    /** Safety-validation metadata that used to wrap the brief. */
+    safety: PhysicianBriefSafety | null;
+    /** The stored value as-is (wrapper or legacy flat brief) for audit/compat. */
+    briefRaw: AIResponseWrapper<PhysicianBrief> | PhysicianBrief | null;
+    transcript: string | null;
+    generatedAt: string | null;
+    /** 'generating' when a lazy regeneration was started and did not finish within the timeout. */
+    status: 'ready' | 'missing' | 'generating';
+    error: string | null;
+}
+
+/** Stored briefs are `AIResponseWrapper<PhysicianBrief>`; legacy docs may be flat. */
+export function unwrapPhysicianBrief(raw: any): { brief: PhysicianBrief | null; safety: PhysicianBriefSafety | null } {
+    if (!raw || typeof raw !== 'object') return { brief: null, safety: null };
+    if (raw.suggestion && typeof raw.suggestion === 'object') {
+        const { suggestion, ...rest } = raw;
+        return { brief: suggestion as PhysicianBrief, safety: rest as PhysicianBriefSafety };
+    }
+    return { brief: raw as PhysicianBrief, safety: null };
+}
+
+const BRIEF_REGEN_LOCK_MS = 2 * 60 * 1000;
+const BRIEF_REGEN_TIMEOUT_MS = 20 * 1000;
+
+function toIso(v: any): string | null {
+    if (!v) return null;
+    if (typeof v?.toDate === 'function') { try { return v.toDate().toISOString(); } catch { return null; } }
+    if (v instanceof Date) return v.toISOString();
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+export async function getPhysicianBrief(
+    consultationId: string,
+    opts: { regenerateIfMissing?: boolean } = {},
+): Promise<PhysicianBriefResult> {
+    const [consultDoc, intakeDoc] = await Promise.all([
+        collections.consultations.doc(consultationId).get(),
+        collections.intakeSessions.doc(consultationId).get(),
+    ]);
+    const consult: any = consultDoc.data() || {};
+    const session: any = intakeDoc.data() || {};
+    const transcript: string | null = session.transcript || null;
+
+    let raw = consult.physicianBrief || null;
+    let status: PhysicianBriefResult['status'] = raw ? 'ready' : 'missing';
+    let error: string | null = consult.physicianBriefError || null;
+
+    // Lazy regeneration: the brief is normally generated fire-and-forget at
+    // intake completion; if that failed (model/safety error) the doctor used to
+    // see a 404 forever. Regenerate once per lock window when the intake is done.
+    const intakeDone = consult.intakeCompleted === true || consult.hxIntakeComplete === true;
+    const hasTurns = Array.isArray(session.messages) ? session.messages.length > 0 : !!transcript;
+    if (!raw && opts.regenerateIfMissing && intakeDone && hasTurns) {
+        const startedAtMs = toIso(consult.physicianBriefRegenStartedAt)
+            ? new Date(toIso(consult.physicianBriefRegenStartedAt) as string).getTime()
+            : 0;
+        const lockFresh = startedAtMs > 0 && Date.now() - startedAtMs < BRIEF_REGEN_LOCK_MS;
+        if (lockFresh) {
+            status = 'generating';
+        } else {
+            await collections.consultations.doc(consultationId)
+                .update({ physicianBriefRegenStartedAt: new Date() })
+                .catch(() => { });
+            const regen = generatePhysicianBrief(consultationId)
+                .then((wrapped) => ({ ok: true as const, wrapped }))
+                .catch((e: any) => ({ ok: false as const, message: e?.message || 'brief generation failed' }));
+            const timeout = new Promise<{ ok: false; timeout: true }>((resolve) =>
+                setTimeout(() => resolve({ ok: false, timeout: true }), BRIEF_REGEN_TIMEOUT_MS));
+            const outcome: any = await Promise.race([regen, timeout]);
+            if (outcome.ok) {
+                raw = outcome.wrapped;
+                status = 'ready';
+                error = null;
+            } else if (outcome.timeout) {
+                status = 'generating';
+            } else {
+                status = 'missing';
+                error = outcome.message;
+                await collections.consultations.doc(consultationId)
+                    .update({ physicianBriefError: outcome.message, physicianBriefErrorAt: new Date() })
+                    .catch(() => { });
+            }
+        }
+    }
+
+    const { brief, safety } = unwrapPhysicianBrief(raw);
     return {
-        brief: consultDoc.data()?.physicianBrief || null,
-        transcript: intakeDoc.data()?.transcript || null,
+        brief,
+        safety,
+        briefRaw: raw,
+        transcript,
+        generatedAt: toIso(consult.physicianBriefGeneratedAt),
+        status: brief ? 'ready' : status,
+        error,
     };
 }
 

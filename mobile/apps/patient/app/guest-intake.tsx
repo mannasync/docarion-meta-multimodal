@@ -38,6 +38,30 @@ export default function GuestIntakeScreen() {
   const scrollRef = useRef<ScrollView>(null);
   // Stable guest session id, kept across turns.
   const sessionId = useRef(`guest_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`).current;
+  // Approximate location, asked once: lets an emergency reach the Docarion
+  // admin covering the patient's area straight away and list the nearest
+  // emergency care. Intake works the same without it.
+  const coordsRef = useRef<{ lat: number; lng: number } | null>(null);
+  // Secret for this guest session, issued by the server on the first message.
+  const guestTokenRef = useRef<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const Location = await import('expo-location');
+        let granted = (await Location.getForegroundPermissionsAsync()).granted;
+        if (!granted) granted = (await Location.requestForegroundPermissionsAsync()).granted;
+        if (!granted || cancelled) return;
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        if (!cancelled) coordsRef.current = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      } catch {
+        /* location is optional */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [messages, setMessages] = useState<Msg[]>([{ id: uid(), role: 'assistant', text: WELCOME }]);
   const [input, setInput] = useState('');
@@ -48,7 +72,7 @@ export default function GuestIntakeScreen() {
   const [completeness, setCompleteness] = useState(0);
   const [isComplete, setIsComplete] = useState(false);
   const [ctaSheet, setCtaSheet] = useState(false);
-  const [emergency, setEmergency] = useState<{ shown: boolean; reason?: string }>({ shown: false });
+  const [emergency, setEmergency] = useState<{ shown: boolean; reason?: string; result?: IntakeMessageResult }>({ shown: false });
 
   const scrollToEnd = useCallback(() => {
     requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
@@ -64,12 +88,19 @@ export default function GuestIntakeScreen() {
       setMessages((m) => [...m, { id: uid(), role: 'user', text }]);
       setSending(true);
       try {
-        const res = await intakeApi.guest({ message: text, sessionId, language });
+        const res = await intakeApi.guest({
+          message: text,
+          sessionId,
+          language,
+          ...(coordsRef.current ?? {}),
+          ...(guestTokenRef.current ? { guestToken: guestTokenRef.current } : {}),
+        });
+        if (res.guestToken) guestTokenRef.current = res.guestToken;
         setMessages((m) => [...m, { id: uid(), role: 'assistant', text: res.message }]);
         if (res.triage) setTriage(res.triage);
         if (typeof res.completeness === 'number') setCompleteness(res.completeness);
         const isEmergency = res.emergencyEscalation === true || res.triage?.category === 'emergency';
-        if (isEmergency) setEmergency({ shown: true, reason: res.triage?.reason });
+        if (isEmergency) setEmergency({ shown: true, reason: res.triage?.reason, result: res });
         if (res.isComplete || res.triage) {
           setIsComplete(res.isComplete === true);
           setTimeout(() => setCtaSheet(true), 400);
@@ -95,6 +126,9 @@ export default function GuestIntakeScreen() {
         GUEST_INTAKE_HANDOFF_KEY,
         JSON.stringify({
           sessionId,
+          // The guest token lets the signed-in account ATTACH this server-side
+          // session (transcript + history) to its new consultation — no repeat.
+          guestToken: guestTokenRef.current,
           messages,
           triage,
           completeness,
@@ -355,6 +389,14 @@ export default function GuestIntakeScreen() {
       <EmergencyInterstitial
         visible={emergency.shown}
         reason={emergency.reason}
+        directive={emergency.result?.emergencyDirective}
+        firstAid={emergency.result?.firstAid}
+        locationContext={emergency.result?.locationContext}
+        nearestFacilities={emergency.result?.nearestEmergencyFacilities}
+        followUpRequested={emergency.result?.followUpRequested}
+        sessionId={sessionId}
+        coords={coordsRef.current}
+        guestToken={guestTokenRef.current}
         onClose={() => setEmergency((e) => ({ ...e, shown: false }))}
         onFindFacilities={() => {
           setEmergency((e) => ({ ...e, shown: false }));

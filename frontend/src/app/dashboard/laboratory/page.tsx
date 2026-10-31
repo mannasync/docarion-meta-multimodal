@@ -12,6 +12,7 @@ import { MetricCard } from '@/components/ui/MetricCard';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Button } from '@/components/ui/Button';
 import { DashboardShell } from '@/components/layout/DashboardShell';
+import { CredentialGateBanner } from '@/components/credential/CredentialGateBanner';
 import { toast } from 'react-toastify';
 import { ComplianceBadges } from '@/components/ui/TrustBadge';
 import { DataTable, Column } from '@/components/ui/DataTable';
@@ -25,28 +26,16 @@ import {
 } from '@/components/identifier/PatientSearchBeforeCreate';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { withRoleGuard } from '@/components/shared/withRoleGuard';
+import { calculateTAT } from './_lib/labTat';
+import { usePlatformFacilityContextStore, isContextActive } from '@/store/platformFacilityContext.store';
 
 interface LabOrder {
     orderId: string; patientId?: string; patientName?: string; status: string;
     labRequestNumber?: string;
     tests?: { testId: string; name: string; code: string; price: number }[];
     testName?: string;
-    priority?: string; createdAt?: string; referringFacilityId?: string;
+    priority?: string; createdAt?: string; completedAt?: string; referringFacilityId?: string;
 }
-
-const calculateTAT = (orders: LabOrder[], priority: string) => {
-    // Only orders with both timestamps count: substituting "now" for a missing
-    // completedAt inflated the average every time the page was opened.
-    const relevant = orders.filter(o =>
-        (o.priority || 'routine').toLowerCase() === priority.toLowerCase()
-        && o.status === 'completed' && o.createdAt && (o as any).completedAt);
-    if (relevant.length === 0) return '—';
-    const totalMs = relevant.reduce(
-        (sum, o) => sum + (new Date((o as any).completedAt).getTime() - new Date(o.createdAt as any).getTime()), 0);
-    const avgMinutes = Math.max(0, totalMs / relevant.length / 60000);
-    if (avgMinutes >= 60) return `${(avgMinutes / 60).toFixed(1)}h`;
-    return `${Math.round(avgMinutes)}m`;
-};
 
 function LaboratoryDashboard() {
     const { user } = useAuthStore();
@@ -58,11 +47,24 @@ function LaboratoryDashboard() {
     const [filters, setFilters] = useState<Record<string, string>>({});
     const [loading, setLoading] = useState(true);
     const [loadError, setLoadError] = useState('');
-    const facilityId = user?.facilityId || '';
+    // A super_admin has no laboratory of their own: they read the one they
+    // opened as their audited platform facility context (server-enforced).
+    const isPlatformViewer = user?.role === 'super_admin' && !user?.facilityId;
+    const platformCtx = usePlatformFacilityContextStore((st) => st.context);
+    const platformCtxLoaded = usePlatformFacilityContextStore((st) => st.loaded);
+    const refreshPlatformCtx = usePlatformFacilityContextStore((st) => st.refresh);
+    const facilityId = user?.facilityId || (isPlatformViewer && isContextActive(platformCtx) ? platformCtx.facilityId : '');
+
+    useEffect(() => {
+        if (isPlatformViewer) void refreshPlatformCtx();
+    }, [isPlatformViewer, refreshPlatformCtx]);
 
     const load = useCallback(async () => {
         if (!facilityId) {
-            setLoadError('This account is not linked to a laboratory yet.');
+            if (isPlatformViewer && !platformCtxLoaded) return; // still reading the context
+            setLoadError(isPlatformViewer
+                ? 'Choose a laboratory to view (open it as your facility context) to see its orders.'
+                : 'This account is not linked to a laboratory yet.');
             setLoading(false);
             return;
         }
@@ -88,7 +90,7 @@ function LaboratoryDashboard() {
             toast.error('Failed to load data');
         }
         finally { setLoading(false); }
-    }, [facilityId, isAdmin]);
+    }, [facilityId, isAdmin, isPlatformViewer, platformCtxLoaded]);
 
     useEffect(() => { load(); }, [load]);
 
@@ -246,6 +248,8 @@ function LaboratoryDashboard() {
         >
 
             <div className="container mx-auto px-4 py-6 md:px-6 space-y-6">
+                {/* Licensure wall (P1-8): renders only when the technician's MLSCN credential is incomplete. */}
+                <CredentialGateBanner />
                 {/* Onboarding gate: who can release validated results at this lab. */}
                 <LabValidationReadinessBanner facilityId={facilityId} role={user?.role || ''} />
                 {isAdmin && facilityId && <FacilityOnboardingChecklist facilityId={facilityId} />}

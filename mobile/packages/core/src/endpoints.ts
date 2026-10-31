@@ -6,6 +6,7 @@ import {
   QueueStatus,
   SlaBoardEntry,
   IntakeMessageResult,
+  NearestEmergencyFacility,
   Consultation,
   ChatMessage,
   Prescription,
@@ -389,16 +390,53 @@ function normalizeIntake(raw: Record<string, unknown>): IntakeMessageResult {
       (Array.isArray(raw.emergencyEscalation) && (raw.emergencyEscalation as unknown[]).length > 0) ||
       raw.emergencyEscalation === true,
     triage: (raw.triage as IntakeMessageResult['triage']) ?? undefined,
+    emergencyDirective: (raw.emergencyDirective as string) ?? (raw.emergencyInstructions as string) ?? undefined,
+    firstAid: normalizeFirstAid(raw.firstAid),
+    locationContext: (raw.locationContext as IntakeMessageResult['locationContext']) ?? null,
+    followUpRequested: raw.followUpRequested === true,
+    nearestEmergencyFacilities: Array.isArray(raw.nearestEmergencyFacilities)
+      ? (raw.nearestEmergencyFacilities as NearestEmergencyFacility[])
+      : [],
+    ...(typeof raw.guestToken === 'string' ? { guestToken: raw.guestToken } : {}),
   };
+}
+
+function normalizeFirstAid(raw: unknown): IntakeMessageResult['firstAid'] {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as { combinedLay?: unknown; combinedDoNot?: unknown };
+  const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+  return { combinedLay: strings(r.combinedLay), combinedDoNot: strings(r.combinedDoNot) };
+}
+
+export interface GuestAttachResult {
+  consultationId: string;
+  queueId?: string | null;
+  isComplete: boolean;
+  questionNumber: number;
+  totalExpected?: number;
+  messages: { role: 'user' | 'assistant'; content: string; timestamp?: string }[];
+  triage?: { category?: string; esiLevel?: number; reason?: string } | null;
+  completeness?: number | null;
+  emergencyDetected?: boolean;
+  language?: Language | string;
+  reused?: boolean;
 }
 
 export const intakeApi = {
   message: (body: { message: string; consultationId: string; language?: Language }) =>
     api.post<Record<string, unknown>>('/ai-intake/message', body).then(normalizeIntake),
-  guest: (body: { message: string; sessionId?: string; language?: Language }) =>
+  guest: (body: { message: string; sessionId?: string; language?: Language; lat?: number; lng?: number; guestToken?: string }) =>
     api.post<Record<string, unknown>>('/ai-intake/guest', body, { auth: false }).then(normalizeIntake),
   status: (consultationId: string) => api.get<Record<string, unknown>>(`/ai-intake/${consultationId}/status`),
   getStatus: (consultationId: string) => api.get<Record<string, unknown>>(`/ai-intake/${consultationId}/status`),
+  /**
+   * Attach a GUEST intake session (started before sign-up) to the signed-in
+   * patient: the server copies the transcript/history into a new consultation
+   * so the patient never repeats themselves. Needs the guest token minted on the
+   * first guest message. Returns `{ consultationId, isComplete, messages, … }`.
+   */
+  attachGuest: (sessionId: string, guestToken: string) =>
+    api.post<GuestAttachResult>(`/ai-intake/guest/${encodeURIComponent(sessionId)}/attach`, { guestToken }),
   brief: (consultationId: string) => api.get<Record<string, unknown>>(`/ai-intake/${consultationId}/brief`),
   getBrief: (consultationId: string) => api.get<Record<string, unknown>>(`/ai-intake/${consultationId}/brief`),
   /** Defer AI History (Hx) Intake when booking a future scheduled appointment.
@@ -417,6 +455,13 @@ export const intakeApi = {
     api.post<WalkIn>('/ai-intake/walk-ins', body),
   walkInVitals: (sessionId: string, body: Record<string, unknown>) => api.post(`/ai-intake/walk-ins/${sessionId}/vitals`, body),
   walkInSend: (sessionId: string) => api.post(`/ai-intake/walk-ins/${sessionId}/send`),
+  /**
+   * Close an abandoned front-desk walk-in session ("patient left"). A reason
+   * (>= 3 chars) is required; the server answers 409 `NOT_OPEN` once the
+   * session was already sent to a doctor or closed.
+   */
+  closeWalkIn: (sessionId: string, reason: string) =>
+    api.del<{ sessionId: string; status: string }>(`/ai-intake/walk-ins/${encodeURIComponent(sessionId)}`, { reason }),
   /** Lookup or create a phone-linked patient account at a Care Station / Assisted Intake terminal. */
   careStationPatientLookup: (body: {
     /** One of phone / email / mrn identifies the patient. */
@@ -504,11 +549,110 @@ export const intakeApi = {
     api.post<Record<string, unknown>>(`/ai-intake/${consultationId}/copilot-sync`, body),
 };
 
+/** How a transferred patient travels (no ambulance can be assumed). */
+export type IntakeTransferMode = 'private_vehicle' | 'commercial_vehicle' | 'other' | 'ambulance_private' | 'ambulance_nemsas';
+
+export type EmergencyResolutionOutcome =
+  | 'arrived_at_facility' | 'referred_to_ed' | 'reached_patient_safe' | 'unreachable' | 'other';
+
+/** Intake emergency escalation record as staff see it (with first-aid cards). */
+export interface IntakeEmergencyRecord {
+  sessionId: string;
+  status: 'alerted' | 'acknowledged' | 'ed_episode_started' | 'transfer_requested' | 'resolved';
+  anonymous?: boolean;
+  facilityId: string | null;
+  noDoctorAvailable?: boolean;
+  consultationId?: string | null;
+  patientPhone?: string | null;
+  patientName?: string | null;
+  redFlagIds: string[];
+  context: { kind: 'home' | 'in_facility'; facilityName?: string | null; edCapable?: boolean };
+  notified: { doctorIds: string[]; platformFallback: boolean; alertedAt: string };
+  acknowledgedBy?: { userId: string; name?: string; role: string; facilityName?: string | null; note?: string | null } | null;
+  nearbyFacilities?: Array<{ facilityId: string; name: string | null; distanceKm: number }>;
+  followUpDetails?: { phone: string; name?: string | null; locationNote?: string | null; hasCompanion?: boolean | null; canTravel?: boolean | null } | null;
+  checklistProgress?: Record<string, { done: boolean; doneBy: string; doneAt: string }>;
+  episodeId?: string | null;
+  transferId?: string | null;
+  resolution?: { outcome: EmergencyResolutionOutcome; note?: string | null } | null;
+  firstAid: {
+    version: string;
+    primaryGuidance: { label: string; transferNote: string };
+    combinedStaff: Array<{ id: string; step: string; isDrug?: boolean; standingOrderNote?: string }>;
+    combinedDoNot: string[];
+  };
+}
+
+/** Intake emergency escalation — staff side (Care Station, alerts). */
+export const intakeEmergencyStaffApi = {
+  get: (sessionId: string) => api.get<IntakeEmergencyRecord>(`/ai-intake/${encodeURIComponent(sessionId)}/emergency`),
+  acknowledge: (sessionId: string, note?: string) =>
+    api.post<IntakeEmergencyRecord>(`/ai-intake/${encodeURIComponent(sessionId)}/emergency/acknowledge`, note ? { note } : {}),
+  setChecklistItem: (sessionId: string, itemId: string, done: boolean) =>
+    api.post<IntakeEmergencyRecord>(`/ai-intake/${encodeURIComponent(sessionId)}/emergency/checklist`, { itemId, done }),
+  startEdEpisode: (sessionId: string) =>
+    api.post<{ escalation: IntakeEmergencyRecord }>(`/ai-intake/${encodeURIComponent(sessionId)}/emergency/ed-episode`, {}),
+  transferOptions: (sessionId: string) =>
+    api.get<NearestEmergencyFacility[]>(`/ai-intake/${encodeURIComponent(sessionId)}/emergency/transfer-options`),
+  transfer: (
+    sessionId: string,
+    body: { toFacilityId: string; transportMode: IntakeTransferMode; escort?: string; note?: string },
+  ) => api.post<{ escalation: IntakeEmergencyRecord }>(`/ai-intake/${encodeURIComponent(sessionId)}/emergency/transfer`, body),
+  resolve: (sessionId: string, outcome: EmergencyResolutionOutcome, note?: string) =>
+    api.post<IntakeEmergencyRecord>(`/ai-intake/${encodeURIComponent(sessionId)}/emergency/resolve`, { outcome, note }),
+};
+
+/** Intake emergency escalation — patient side (nearest care, guest call-back details). */
+export const intakeEmergencyApi = {
+  nearestFacilities: (lat: number, lng: number) =>
+    api.get<NearestEmergencyFacility[]>(`/ai-intake/emergency-facilities?lat=${lat}&lng=${lng}`, { auth: false }),
+  sendGuestDetails: (
+    sessionId: string,
+    body: {
+      phone: string;
+      name?: string;
+      locationNote?: string;
+      state?: string;
+      hasCompanion?: boolean | null;
+      canTravel?: boolean | null;
+      lat?: number;
+      lng?: number;
+      guestToken?: string;
+    },
+  ) =>
+    api.post<{ received: boolean; status: string; nearestEmergencyFacilities: NearestEmergencyFacility[] }>(
+      `/ai-intake/guest/${encodeURIComponent(sessionId)}/emergency-details`,
+      body,
+      { auth: false },
+    ),
+  /**
+   * "Let the hospital know I'm coming". A guest uses their own session (no
+   * auth); a signed-in patient their own emergency (consultation id).
+   */
+  /** Share the patient's location so the nearest Docarion sites can help. */
+  shareLocation: (sessionId: string, body: { lat: number; lng: number; guestToken?: string }, opts: { guest?: boolean } = {}) =>
+    api.post<{ nearbyFacilitiesAlerted: number }>(
+      `/ai-intake/${encodeURIComponent(sessionId)}/emergency/location`,
+      body,
+      opts.guest ? { auth: false } : undefined,
+    ),
+  tellHospitalComing: (
+    sessionId: string,
+    body: { facilityId: string; etaMinutes?: number; lat?: number; lng?: number; guestToken?: string },
+    opts: { guest?: boolean } = {},
+  ) =>
+    api.post<{ facilityId: string; facilityName: string | null; notifiedAt: string | null }>(
+      `/ai-intake/${encodeURIComponent(sessionId)}/emergency/coming`,
+      body,
+      opts.guest ? { auth: false } : undefined,
+    ),
+};
+
 export const aiIntakeApi = intakeApi;
 
 // ── Telehealth queue ────────────────────────────────────────────────────────
 export const queueApi = {
-  join: (body: { symptoms?: string; urgencyLevel?: string; preferredLanguage?: Language; facilityId?: string; dependentId?: string }) =>
+  join: (body: { symptoms?: string; urgencyLevel?: string; preferredLanguage?: Language; facilityId?: string; dependentId?: string; consultationId?: string }) =>
     api.post<QueueStatus>('/telehealth-queue/join', body),
   leave: () => api.del('/telehealth-queue/leave'),
   myStatus: (dependentId?: string) => api.get<QueueStatus>('/telehealth-queue/my-status', { dependentId }),
@@ -592,6 +736,9 @@ export interface QueueEntry {
   symptoms?: string;
   joinedAt?: string;
   facilityId?: string;
+  /** Per-row claim state (server-computed for the caller). */
+  canClaim?: boolean;
+  claimBlockedReason?: string | null;
   [key: string]: unknown;
 }
 
@@ -604,10 +751,105 @@ export interface QueueStats {
 }
 
 // ── Scheduling ──────────────────────────────────────────────────────────────
+export interface NextAvailableSlotRow {
+  date: string;
+  startTime: string;
+  endTime: string;
+  startAt: string | null;
+  endAt: string | null;
+  doctorId: string;
+  doctorIds: string[];
+  servedBy: 'facility' | 'platform';
+}
+
+export interface AgendaRow {
+  appointmentId: string;
+  consultationId: string | null;
+  date: string;
+  startTime: string | null;
+  endTime: string | null;
+  startAt: string | null;
+  endAt: string | null;
+  timeZone: string;
+  type: string;
+  status: string;
+  consultationStatus: string | null;
+  doctorId: string | null;
+  doctorName: string | null;
+  patientId: string | null;
+  patientName: string | null;
+  dependentId: string | null;
+  facilityId: string | null;
+  servedBy: 'facility' | 'platform';
+  reason: string | null;
+  origin: string | null;
+  checkedInAt: unknown;
+  queuedAt: unknown;
+  lateReleasedAt: unknown;
+  needsDoctor: boolean;
+}
+
+export interface PatientScheduleItem {
+  id: string;
+  kind: 'appointment' | 'medication' | 'lab' | 'radiology' | 'recall';
+  at: string;
+  date: string;
+  time: string | null;
+  title: string;
+  subtitle: string | null;
+  status: string;
+  needsAction: boolean;
+  url: string;
+  consultationId?: string | null;
+  appointmentId?: string | null;
+  prescriptionId?: string | null;
+  orderId?: string | null;
+  doctorName?: string | null;
+  facilityName?: string | null;
+  servedBy?: 'facility' | 'platform' | null;
+}
+
+/** The patient's schedule hub (GET /patients/me/schedule) + per-prescription reminder mute. */
+export const patientScheduleApi = {
+  mySchedule: (query?: { from?: string; to?: string }) =>
+    api.get<{ from: string; to: string; items: PatientScheduleItem[] }>('/patients/me/schedule', query),
+  setPrescriptionRemindersMuted: (prescriptionId: string, muted: boolean) =>
+    api.post<{ prescriptionId: string; muted: boolean; updated: number }>(`/patients/reminders/prescription/${prescriptionId}/mute`, { muted }),
+  routeLabOrder: (orderId: string, laboratoryId: string) =>
+    api.post(`/patients/lab-orders/${orderId}/route`, { laboratoryId }),
+};
+
+export interface NextAvailableResult {
+  from: string;
+  days: number;
+  facilityId: string | null;
+  slots: NextAvailableSlotRow[];
+  doctors: Record<string, { name: string; specialization: string | null; servedBy: 'facility' | 'platform' }>;
+  platformCover: 'none' | 'agreement' | 'central_cover' | 'no_facility_doctors' | null;
+}
+
 export const schedulingApi = {
   /** Doctors a patient can book (same list as the web booking drawer; licensure-checked on the server). */
   bookableDoctors: (query?: { specialization?: string; limit?: number }) => api.get<unknown[]>('/doctors', { limit: 50, ...query }),
-  doctorSlots: (doctorId: string, query?: { date?: string }) => api.get<unknown[]>(`/scheduling/doctors/${doctorId}/slots`, query),
+  /** One doctor's slots for a day (`date`) or a range (`startDate`/`endDate`, max 14 days). */
+  doctorSlots: (doctorId: string, query?: { date?: string; startDate?: string; endDate?: string }) =>
+    api.get<unknown[]>(`/scheduling/doctors/${doctorId}/slots`, query),
+  /**
+   * Every bookable time across the doctors this patient may book, merged by
+   * start instant (each row names the doctor to book: `doctorId`, plus
+   * `doctorIds` free at the same time and `servedBy` facility | platform).
+   */
+  nextAvailable: (query?: { facilityId?: string; specialization?: string; from?: string; days?: number }) =>
+    api.get<NextAvailableResult>('/scheduling/next-available', query),
+  /**
+   * One agenda for every role: doctor → own visits, patient → own, facility
+   * staff → their facility's visits (incl. Docarion-served ones), platform/CS → all.
+   */
+  agenda: (query?: { from?: string; to?: string; facilityId?: string; doctorId?: string; dependentId?: string; status?: string; servedBy?: 'facility' | 'platform'; limit?: number }) =>
+    api.get<AgendaRow[]>('/scheduling/agenda', query),
+  /** Front desk: the patient has arrived — bridge the visit to the queue, assigned to the booked doctor. */
+  checkIn: (appointmentId: string) =>
+    api.post<{ appointmentId: string; consultationId: string | null; queueId: string | null; assignedDoctorId: string | null }>(`/scheduling/appointments/${appointmentId}/check-in`, {}),
   bookSlot: (body: Record<string, unknown>) => api.post('/scheduling/slots/book', body),
   appointments: (query?: Record<string, string | undefined>) => api.get<unknown[]>('/scheduling/appointments', query),
   appointment: (id: string) => api.get(`/scheduling/appointments/${id}`),
@@ -2273,6 +2515,14 @@ export interface HandoffPayload {
   endOnly?: boolean;
   pharmacy?: { pharmacyId?: string; create?: boolean; medications?: unknown[]; instructions?: string };
   lab?: { laboratoryId?: string; tests: Array<{ name: string; price?: number }>; priority?: string };
+  radiology?: {
+    radiologyCenterId?: string;
+    studies: Array<{ name: string; modality?: string; bodyPart?: string; price?: number; studyId?: string }>;
+    priority?: 'routine' | 'urgent' | 'stat';
+    clinicalIndication?: string;
+    contrastRequired?: boolean;
+    notes?: string;
+  };
   referral?: { facilityId?: string; specialty?: string; reason?: string; urgency?: string };
   followUp?: { timeframe?: string; reason?: string; type?: string; date?: string };
 }
@@ -2280,8 +2530,11 @@ export interface HandoffSummary {
   completed: boolean;
   pharmacy?: { pharmacyId: string | null; patientMustChoose: boolean; prescriptionId?: string };
   lab?: { laboratoryId: string | null; patientMustChoose: boolean; labOrderId: string };
+  radiology?: { radiologyCenterId: string | null; patientMustChoose: boolean; radiologyOrderId: string };
   referralId?: string;
   followUpSuggestionId?: string;
+  /** Set when the follow-up was BOOKED with the same doctor (first free slot from the target day). */
+  followUpAppointment?: { appointmentId: string; consultationId: string; doctorId: string; date: string; startTime: string };
   [key: string]: unknown;
 }
 export const consultHandoffApi = {
@@ -2308,6 +2561,11 @@ export interface LabOrder {
   tests?: Array<{ name?: string; code?: string; price?: number } | string>;
   totalCost?: number;
   paymentStatus?: string;
+  /** Set once a result has been entered (hardened or legacy results route). */
+  resultId?: string | null;
+  /** Bench QC approval stamp (POST /laboratories/orders/:id/qc-approve). */
+  qcApprovedAt?: unknown;
+  qcApprovedBy?: string | null;
   createdAt?: unknown;
   labRequestNumber?: string;
   specimenNumber?: string;
@@ -2355,6 +2613,18 @@ export const labQueueApi = {
    */
   validate: (orderId: string) =>
     api.post<Record<string, unknown>>(`/laboratories/orders/${orderId}/validate`),
+  /**
+   * Bench QC approval before four-eyes validation. Requires an entered result
+   * (the backend answers 409 RESULT_REQUIRED otherwise) and parks the order at
+   * 'awaiting_validation'. Never use updateStatus('awaiting_validation') — the
+   * bare status write is refused without a result.
+   * Backend: POST /laboratories/orders/:orderId/qc-approve — lab_technician/lab_admin.
+   */
+  qcApprove: (orderId: string, body?: { note?: string }) =>
+    api.post<{ orderId: string; resultId: string; status: string; previousStatus: string }>(
+      `/laboratories/orders/${orderId}/qc-approve`,
+      body || {},
+    ),
 };
 
 /**
@@ -2387,9 +2657,74 @@ export const queueControlApi = {
   /** Return an assigned patient to waiting (keeps their place in line). Accepts queueId OR consultationId. */
   release: (queueOrConsultationId: string, reason?: string) =>
     api.post(`/telehealth-queue/${queueOrConsultationId}/release`, { reason }),
-  noShow: (queueId: string) => api.patch(`/telehealth-queue/${queueId}/no-show`),
+  /**
+   * Mark a queue row as no-show. The server REQUIRES a reason (>= 3 chars,
+   * e.g. "called twice, no answer") and lets any doctor who can see the row
+   * do it. Prefer `consultationDispositionApi.decline` when you hold the
+   * consultation id — it also notifies and refunds the patient.
+   */
+  noShow: (queueId: string, reason: string) =>
+    api.patch(`/telehealth-queue/${encodeURIComponent(queueId)}/no-show`, { reason }),
+  /** Put the patient back in line (keeps the consultation, notifies the patient). */
   requeue: (queueId: string, priority: 'front' | 'back' = 'back') =>
-    api.post(`/telehealth-queue/${queueId}/requeue`, { priority }),
+    api.post(`/telehealth-queue/${encodeURIComponent(queueId)}/requeue`, { priority }),
+};
+
+/** Why a doctor cannot claim a queue row right now (`GET /telehealth-queue/queue` rows). */
+export type ClaimBlockedReason =
+  | 'assigned_to_you'
+  | 'already_claimed'
+  | 'in_consultation'
+  | 'intake_in_progress'
+  | (string & {});
+
+/** Short staff-facing label for a `claimBlockedReason` value. */
+export function claimBlockedLabel(reason: ClaimBlockedReason | null | undefined): string | null {
+  if (!reason) return null;
+  switch (reason) {
+    case 'assigned_to_you': return 'Already yours';
+    case 'already_claimed': return 'Claimed by another clinician';
+    case 'in_consultation': return 'Consultation in progress';
+    case 'intake_in_progress': return 'Intake still in progress';
+    default: return `Not claimable (${String(reason).replace(/_/g, ' ')})`;
+  }
+}
+
+/** Why a doctor declined / could not see a waiting patient. */
+export const DECLINE_OUTCOMES = ['no_show', 'cannot_reach', 'not_suitable', 'duplicate', 'patient_request', 'other'] as const;
+export type DeclineOutcome = (typeof DECLINE_OUTCOMES)[number];
+
+export const DECLINE_OUTCOME_LABELS: Record<DeclineOutcome, string> = {
+  no_show: 'Patient did not show',
+  cannot_reach: "Can't reach the patient",
+  not_suitable: 'Not suitable for telehealth',
+  duplicate: 'Duplicate request',
+  patient_request: 'Patient asked to cancel',
+  other: 'Other',
+};
+
+export interface DeclineConsultationBody {
+  outcome: DeclineOutcome;
+  /** 3–300 chars; REQUIRED when outcome is 'other'. */
+  reason?: string;
+}
+
+export interface DeclineConsultationResult {
+  status: 'no_show' | 'cancelled';
+  outcome: DeclineOutcome;
+  refund: unknown;
+  queueUpdated: boolean;
+}
+
+/**
+ * Doctor disposition of a waiting/assigned consultation that will not go
+ * ahead. The server notifies and refunds the patient and updates the queue
+ * row; 404 when the row is not visible to this doctor, 409 `NOT_DECLINABLE`
+ * once the consultation is in progress or finished.
+ */
+export const consultationDispositionApi = {
+  decline: (consultationId: string, body: DeclineConsultationBody) =>
+    api.post<DeclineConsultationResult>(`/consultations/${encodeURIComponent(consultationId)}/decline`, body),
 };
 
 /** A diagnostics-tier order: mid-consult tests, billed before completion. */
@@ -4423,4 +4758,239 @@ export const academyApi = {
     api.post<AcademyAttempt>(`/academy/attempts/${academySeg(attemptId)}/submit`, { answers }),
   certificate: (certificateId: string) =>
     api.get<AcademyCertificate>(`/academy/certificates/${academySeg(certificateId)}`),
+};
+
+
+// ── Care Station accounts + per-staff PIN step-in ───────────────────────────
+// A registered device runs the kiosk on its own STATION token; every clinical
+// action is done under a 10-minute STEP-IN token issued to ONE named staff
+// member after they enter their own PIN. See `careStation/session.ts`.
+import { withStationAuth, type StepInStaff } from './careStation/session';
+import type { RequestOptions } from './api/client';
+
+export interface CareStationRecord {
+  stationId: string;
+  facilityId: string;
+  name: string;
+  status: 'pending' | 'active' | 'revoked' | string;
+  createdAt?: unknown;
+  enrollmentExpiresAt?: unknown;
+  lastSeenAt?: unknown;
+}
+
+export interface CareStationStaffOption {
+  userId: string;
+  name: string;
+  role: string;
+}
+
+export interface CareStationStepInResult {
+  accessToken: string;
+  expiresIn: number;
+  staff: StepInStaff;
+}
+
+export const careStationApi = {
+  // Site admin, normal staff session.
+  list: () => api.get<CareStationRecord[]>('/care-stations'),
+  create: (name: string) =>
+    api.post<{ station: CareStationRecord; enrollmentCode: string }>('/care-stations', { name }),
+  revoke: (stationId: string) =>
+    api.post<unknown>(`/care-stations/${encodeURIComponent(stationId)}/revoke`, {}),
+
+  // Device enrolment (public: the 8-character code is the credential).
+  enroll: (code: string) =>
+    api.post<{ station: CareStationRecord; stationToken: string }>(
+      '/care-stations/enroll',
+      { code: code.trim().toUpperCase() },
+      { auth: false },
+    ),
+
+  // Station device (station token).
+  me: () => withStationAuth('station', (o) => api.get<CareStationRecord>('/care-stations/me', undefined, o)),
+  staff: () =>
+    withStationAuth('station', (o) => api.get<CareStationStaffOption[]>('/care-stations/staff', undefined, o)),
+  /** 401 PIN_INCORRECT, 429 PIN_LOCKED surface as ApiError. Does NOT auto-clear the station. */
+  stepIn: (staffUserId: string, pin: string) =>
+    withStationAuth('station', (o) =>
+      api.post<CareStationStepInResult>('/care-stations/step-in', { staffUserId, pin }, o),
+    ),
+
+  // Personal PIN (normal staff session). 403 REAUTH_REQUIRED -> confirm-it's-you sheet.
+  pinStatus: () => api.get<{ hasPin: boolean }>('/care-stations/pin'),
+  setPin: (pin: string) => api.put<unknown>('/care-stations/pin', { pin }),
+};
+
+/** Same call shapes as the `intakeApi` members they stand in for. */
+export type CareStationIntakeSurface = Pick<
+  typeof intakeApi,
+  | 'careStationPatientLookup'
+  | 'walkInChat'
+  | 'createHandoffToken'
+  | 'getTerminalSession'
+  | 'sendTerminalMessage'
+  | 'walkInVitals'
+  | 'walkInSend'
+  | 'nurseComplete'
+>;
+
+/**
+ * Intake calls for a registered station device. Patient-facing ones carry the
+ * station token; the clinical ones (vitals, send to doctor, nurse completion)
+ * carry the step-in token and refuse with `STAFF_STEP_IN_REQUIRED` locally if
+ * nobody is stepped in.
+ */
+export const careStationIntakeApi: CareStationIntakeSurface = {
+  careStationPatientLookup: (body) =>
+    withStationAuth('station', (o) => api.post('/ai-intake/care-station/patient-lookup', body, o)),
+  walkInChat: (sessionId, body) =>
+    withStationAuth('station', (o) =>
+      api.post(`/ai-intake/walk-ins/${encodeURIComponent(sessionId)}/chat`, body, o),
+    ),
+  createHandoffToken: (sessionId) =>
+    withStationAuth('station', (o) =>
+      api.post(`/ai-intake/walk-ins/${encodeURIComponent(sessionId)}/handoff-token`, undefined, o),
+    ),
+  getTerminalSession: (consultationId) =>
+    withStationAuth('station', (o) =>
+      api.get(`/ai-intake/care-station/${encodeURIComponent(consultationId)}/terminal`, undefined, o),
+    ),
+  sendTerminalMessage: (consultationId, body) =>
+    withStationAuth('station', (o) =>
+      api.post(`/ai-intake/care-station/${encodeURIComponent(consultationId)}/terminal-message`, body, o),
+    ),
+  walkInVitals: (sessionId, body) =>
+    withStationAuth('stepIn', (o) =>
+      api.post(`/ai-intake/walk-ins/${encodeURIComponent(sessionId)}/vitals`, body, o),
+    ),
+  walkInSend: (sessionId) =>
+    withStationAuth('stepIn', (o) =>
+      api.post(`/ai-intake/walk-ins/${encodeURIComponent(sessionId)}/send`, undefined, o),
+    ),
+  nurseComplete: (consultationId, data) =>
+    withStationAuth('stepIn', (o) =>
+      api.post(`/ai-intake/${encodeURIComponent(consultationId)}/nurse-complete`, data, o),
+    ),
+} as CareStationIntakeSurface;
+
+/**
+ * `intakeEmergencyStaffApi` under the step-in token, for the Care Station
+ * (an `EmergencyActionCard` given this surface acts as the stepped-in person).
+ */
+export type IntakeEmergencyStaffSurface = typeof intakeEmergencyStaffApi;
+
+function stepInEmergency(): IntakeEmergencyStaffSurface {
+  const call = <T>(fn: (o: RequestOptions) => Promise<T>) => withStationAuth('stepIn', fn);
+  const base = (id: string) => `/ai-intake/${encodeURIComponent(id)}/emergency`;
+  return {
+    get: (id) => call((o) => api.get(base(id), undefined, o)),
+    acknowledge: (id, note) => call((o) => api.post(`${base(id)}/acknowledge`, note ? { note } : {}, o)),
+    setChecklistItem: (id, itemId, done) => call((o) => api.post(`${base(id)}/checklist`, { itemId, done }, o)),
+    startEdEpisode: (id) => call((o) => api.post(`${base(id)}/ed-episode`, {}, o)),
+    transferOptions: (id) => call((o) => api.get(`${base(id)}/transfer-options`, undefined, o)),
+    transfer: (id, body) => call((o) => api.post(`${base(id)}/transfer`, body, o)),
+    resolve: (id, outcome, note) => call((o) => api.post(`${base(id)}/resolve`, { outcome, note }, o)),
+  } as IntakeEmergencyStaffSurface;
+}
+
+export const intakeEmergencyStepInApi: IntakeEmergencyStaffSurface = stepInEmergency();
+
+// ── Consultation calls (video or audio-only) ────────────────────────────────
+/** Room returned by create-or-get; `callMode` is the mode the room was created in. */
+export interface ConsultationCallRoom {
+  roomId: string;
+  consultationId: string;
+  status: string;
+  callMode: 'video' | 'audio';
+  iceServers: unknown[];
+}
+
+export const consultationCallApi = {
+  /**
+   * Create-or-get the ACTIVE call room for a consultation and provision
+   * Realtime Database signaling access for both participants. `callMode`
+   * only applies when a new room is created.
+   */
+  ensureRoom: (consultationId: string, callMode: 'video' | 'audio' = 'video') =>
+    api.post<ConsultationCallRoom>(`/video/consultations/${encodeURIComponent(consultationId)}/video-token`, { callMode }),
+};
+
+// ── Live AI scribe status / consent (patient + doctor) ──────────────────────
+export interface LiveScribeStatus {
+  consultationId: string;
+  providerAvailable: boolean;
+  consentActive: boolean;
+  consentRequested: boolean;
+  scribeActive: boolean;
+  sessionStatus: string;
+}
+
+export const liveScribeApi = {
+  status: (consultationId: string) =>
+    api.get<LiveScribeStatus>(`/live-scribe/consultations/${encodeURIComponent(consultationId)}/status`),
+  recordConsent: (consultationId: string, consentGiven: boolean) =>
+    api.post<{ consultationId: string; consentActive: boolean }>(`/live-scribe/consultations/${encodeURIComponent(consultationId)}/consent`, { consentGiven }),
+  optOut: (consultationId: string) =>
+    api.post<{ consultationId: string; consentActive: boolean; scribeActive: boolean }>(`/live-scribe/consultations/${encodeURIComponent(consultationId)}/opt-out`),
+};
+
+// ── Private emergency-transport providers (aid to reaching hospital) ────────
+/**
+ * Independent providers, fees apply. Shown to patients only beside the
+ * instruction to get to the nearest hospital emergency room with someone
+ * taking them, never as a reason to wait at home. Verified entries only; no air.
+ */
+export interface NearestEmergencyService {
+  serviceId: string;
+  name: string;
+  kind: 'private_ambulance' | 'emergency_response' | 'hospital_ambulance' | 'air_ambulance';
+  phones: string[];
+  whatsapp: string | null;
+  distanceKm: number | null;
+  coversYourState: boolean;
+  verified: boolean;
+  is24x7: boolean;
+  hours: string | null;
+  pricingHint: string | null;
+}
+
+export const emergencyServicesApi = {
+  /** Needs lat/lng or a Nigerian state; the API answers 400 with neither. */
+  nearby: (lat?: number | null, lng?: number | null, state?: string | null) =>
+    api.get<NearestEmergencyService[]>(
+      '/ai-intake/emergency-services',
+      {
+        ...(lat != null && lng != null ? { lat, lng } : {}),
+        ...(state ? { state } : {}),
+      },
+      { auth: false },
+    ),
+};
+
+// ── Consultation money actions (awaiting_payment shortfall path) ───────────
+
+export interface ConsultPayResult {
+  consultationId: string;
+  paymentStatus: 'paid' | 'completed' | 'waived' | string;
+  status: string;
+  price: number;
+  paidAmount: number | null;
+}
+
+export interface ConsultWaiveResult {
+  consultationId: string;
+  paymentStatus: 'waived';
+  status: string;
+}
+
+export const consultationMoneyApi = {
+  /**
+   * Patient settles an OUTSTANDING consult balance from their wallet (post-service
+   * settlement — works in any clinical status, never gates care). Expect 402
+   * `INSUFFICIENT_WALLET_BALANCE` with `data.shortfall` when still short, 409
+   * `NO_OUTSTANDING_BALANCE` when nothing is owed.
+   */
+  pay: (id: string) => api.post<ConsultPayResult>(`/consultations/${id}/pay`),
+  /** Admin / facility admin of that facility waives the fee (reason required, audited server-side). */
+  waive: (id: string, reason: string) => api.post<ConsultWaiveResult>(`/consultations/${id}/waive`, { reason }),
 };

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
@@ -35,10 +35,26 @@ import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { withRoleGuard } from '@/components/shared/withRoleGuard';
 import { useAuthStore } from '@/store/auth.store';
-import api, { aiIntakeApi, adminApi } from '@/services/api';
+import api, {
+  aiIntakeApi,
+  adminApi,
+  authApi,
+  makeCareStationIntakeApi,
+  makeCareStationDeviceApi,
+  makeIntakeEmergencyStaffApi,
+  type CareStationIntakeApi,
+  type CareStationStepIn,
+  type CareStationStaffMember,
+} from '@/services/api';
+import { createCareStationClient, clearStationToken, getStationToken } from '@/lib/careStationClient';
+import { readErrorCode } from '@/lib/accessError';
+import StaffStepInModal from '@/components/care-station/StaffStepInModal';
+import StationManagement from '@/components/care-station/StationManagement';
 import { toast } from 'react-toastify';
 import { actionErrorMessage } from '@/lib/accessError';
 import { MetaMultimodalScanner } from '@/components/ai/MetaMultimodalScanner';
+import { canViewClinicalInsights } from '@/lib/clinicalCapabilities';
+import EmergencyActionPanel from '@/components/intake/EmergencyActionPanel';
 
 type StationMode = 'assisted' | 'kiosk' | 'settings';
 type IntakeMethod = 'ai_chat' | 'structured_hx' | 'multimodal_scan';
@@ -114,17 +130,30 @@ function maskPatientName(name: string): string {
   return maskedFirst;
 }
 
-function CareStationPage() {
+/** A device registered as a Care Station (validated against GET /care-stations/me). */
+export interface RegisteredStation {
+  token: string;
+  stationId: string;
+  facilityId: string;
+}
+
+/**
+ * Care Station console. With `stationMode` the device is a registered station:
+ * it shows the patient kiosk with NO staff signed in, patient-facing calls use
+ * the station token, and staff step in with their own PIN for clinical actions.
+ * Without it the page is the signed-in staff console (shared Station PIN kiosk).
+ */
+function CareStationPage({ stationMode }: { stationMode?: RegisteredStation }) {
   const { user } = useAuthStore();
   const router = useRouter();
   const searchParams = useSearchParams();
-  // No fake fallback facility: a station with no facility must not read or
-  // write another tenant's config under a placeholder id.
-  const facilityId = user?.facilityId || '';
-  const isSiteAdmin = Boolean(user?.role && SITE_ADMIN_ROLES.has(user.role));
+  // No placeholder facility: a station with no facility must not read or write
+  // config under a made-up id.
+  const facilityId = stationMode?.facilityId || user?.facilityId || '';
+  const isSiteAdmin = !stationMode && Boolean(user?.role && SITE_ADMIN_ROLES.has(user.role));
 
-  // Mode state
-  const [activeMode, setActiveMode] = useState<StationMode>('assisted');
+  // Mode state: a registered station is always the kiosk.
+  const [activeMode, setActiveMode] = useState<StationMode>(stationMode ? 'kiosk' : 'assisted');
   const [intakeMethod, setIntakeMethod] = useState<IntakeMethod>('ai_chat');
 
   // Admin & Kiosk Configuration state
@@ -134,13 +163,13 @@ function CareStationPage() {
     kioskModeEnabled: true,
     allowedRoles: ['pharmacist', 'receptionist', 'nurse', 'midwife', 'care_home_nurse', 'medicine_store_attendant'],
     stationPin: '',
-    stationName: 'Care Station Terminal #1',
+    stationName: stationMode ? 'Docarion Care Station' : 'Care Station Terminal #1',
   });
   const [savingConfig, setSavingConfig] = useState(false);
 
   // Kiosk Lock State
   const [kioskPinSetup, setKioskPinSetup] = useState('');
-  const [kioskLocked, setKioskLocked] = useState(false);
+  const [kioskLocked, setKioskLocked] = useState(Boolean(stationMode));
   const [showUnlockModal, setShowUnlockModal] = useState(false);
   const [unlockPinAttempt, setUnlockPinAttempt] = useState('');
   const [unlockError, setUnlockError] = useState('');
@@ -194,9 +223,123 @@ function CareStationPage() {
   const [terminalInput, setTerminalInput] = useState('');
   const [sendingTerminalMsg, setSendingTerminalMsg] = useState(false);
 
-  // Meta Muse Wonder Co-Pilot State
+  // Meta Muse Wonder Co-Pilot State — provider-side only (never rendered on the
+  // patient-facing kiosk; staff console shows it only to clinical roles).
   const [copilotData, setCopilotData] = useState<CopilotData | null>(null);
   const [loadingCopilot, setLoadingCopilot] = useState(false);
+  const canSeeClinicalCopilot = canViewClinicalInsights(user);
+
+  // Kiosk Step 2 (vitals): staff-only, behind the Station PIN. The patient
+  // sees status, never a vitals form.
+  const [kioskVitalsRecorded, setKioskVitalsRecorded] = useState(false);
+  const [showStaffVitalsModal, setShowStaffVitalsModal] = useState(false);
+  const [staffVitalsPin, setStaffVitalsPin] = useState('');
+  const [staffVitalsUnlocked, setStaffVitalsUnlocked] = useState(false);
+  const [staffVitalsError, setStaffVitalsError] = useState('');
+  const [savingStaffVitals, setSavingStaffVitals] = useState(false);
+
+  // Red-flag emergency raised during intake (or opened from a staff alert link).
+  const [emergencySessionId, setEmergencySessionId] = useState<string | null>(null);
+  // Kiosk: staff open the action panel with the Station PIN; the patient only
+  // sees the calm "staff are coming" message.
+  const [kioskEmergencyPanelOpen, setKioskEmergencyPanelOpen] = useState(false);
+  const [kioskEmergencyPin, setKioskEmergencyPin] = useState('');
+  const [kioskEmergencyPinError, setKioskEmergencyPinError] = useState('');
+  const [kioskEmergencyPinPrompt, setKioskEmergencyPinPrompt] = useState(false);
+
+  // Registered station: patient-facing calls use the station token; clinical
+  // calls use the staff member's own step-in token, which lives in memory only.
+  const [stepIn, setStepIn] = useState<{ token: string; staff: CareStationStaffMember; expiresAt: number } | null>(null);
+  const [stepInNow, setStepInNow] = useState(() => Date.now());
+  const [showStepInModal, setShowStepInModal] = useState(false);
+  const stepInPending = useRef<((api: CareStationIntakeApi) => void) | null>(null);
+
+  const stationClient = useMemo(
+    () => (stationMode ? createCareStationClient(stationMode.token) : null),
+    [stationMode],
+  );
+  const stationDeviceApi = useMemo(
+    () => (stationClient ? makeCareStationDeviceApi(stationClient) : null),
+    [stationClient],
+  );
+  const stationIntakeApi = useMemo(
+    () => (stationClient ? makeCareStationIntakeApi(stationClient) : null),
+    [stationClient],
+  );
+  const stepInClient = useMemo(
+    () => (stepIn ? createCareStationClient(stepIn.token) : null),
+    [stepIn?.token], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const stepInIntakeApi = useMemo(
+    () => (stepInClient ? makeCareStationIntakeApi(stepInClient) : null),
+    [stepInClient],
+  );
+  const stepInEmergencyApi = useMemo(
+    () => (stepInClient ? makeIntakeEmergencyStaffApi(stepInClient) : undefined),
+    [stepInClient],
+  );
+  /** Patient-facing intake calls: the station token on a registered station, else the signed-in session. */
+  const patientApi: CareStationIntakeApi = stationIntakeApi ?? aiIntakeApi;
+
+  const lockStepIn = (message?: string) => {
+    stepInPending.current = null;
+    setStepIn(null);
+    setShowStepInModal(false);
+    setKioskEmergencyPanelOpen(false);
+    closeStaffVitalsModal();
+    if (message) toast.info(message);
+  };
+
+  /**
+   * Run a clinical action. On a registered station it needs a staff step-in
+   * (prompting for one when needed); elsewhere it uses the signed-in session.
+   */
+  const runWithStepIn = (fn: (api: CareStationIntakeApi) => void | Promise<void>) => {
+    if (!stationMode) {
+      void fn(aiIntakeApi);
+      return;
+    }
+    if (stepIn && stepInIntakeApi && Date.now() < stepIn.expiresAt) {
+      void fn(stepInIntakeApi);
+      return;
+    }
+    stepInPending.current = fn;
+    setShowStepInModal(true);
+  };
+
+  const handleStepInSuccess = (result: CareStationStepIn) => {
+    const next = {
+      token: result.accessToken,
+      staff: result.staff,
+      expiresAt: Date.now() + Math.max(30, Number(result.expiresIn) || 600) * 1000,
+    };
+    setStepIn(next);
+    setStepInNow(Date.now());
+    setShowStepInModal(false);
+    const pending = stepInPending.current;
+    stepInPending.current = null;
+    if (pending) void pending(makeCareStationIntakeApi(createCareStationClient(next.token)));
+    toast.success(`Stepped in as ${result.staff?.name || 'staff'}.`);
+  };
+
+  // Countdown + automatic lock when the step-in expires.
+  useEffect(() => {
+    if (!stepIn) return;
+    const t = setInterval(() => {
+      const now = Date.now();
+      setStepInNow(now);
+      if (now >= stepIn.expiresAt) lockStepIn('Staff step-in expired. Step in again to continue.');
+    }, 1000);
+    return () => clearInterval(t);
+  }, [stepIn]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const stepInSecondsLeft = stepIn ? Math.max(0, Math.ceil((stepIn.expiresAt - stepInNow) / 1000)) : 0;
+
+  // A staff alert links to /care-station?sessionId=… — open its emergency panel.
+  useEffect(() => {
+    const alertSessionId = searchParams?.get('sessionId');
+    if (alertSessionId) setEmergencySessionId(alertSessionId);
+  }, [searchParams]);
 
   // Sync mode with URL query parameter if provided
   useEffect(() => {
@@ -211,7 +354,7 @@ function CareStationPage() {
 
   // Load facility Care Station configuration
   useEffect(() => {
-    if (!facilityId || typeof adminApi?.getCareStationConfig !== 'function') return;
+    if (stationMode || !facilityId || typeof adminApi?.getCareStationConfig !== 'function') return;
     let cancelled = false;
     Promise.resolve(adminApi.getCareStationConfig(facilityId))
       .then((res) => {
@@ -237,7 +380,7 @@ function CareStationPage() {
     return () => {
       cancelled = true;
     };
-  }, [facilityId]);
+  }, [facilityId, stationMode]);
 
   // Reset all patient PHI state (used when ending a Kiosk session or starting a new patient)
   const resetPatientSessionState = () => {
@@ -265,8 +408,22 @@ function CareStationPage() {
     setTerminalMessages([]);
     setTerminalInput('');
     setTerminalStatus('waiting_doctor');
-    // AI differentials / red flags belong to the patient they were generated for.
+    // Clinical co-pilot output is patient data — never carry it to the next patient.
     setCopilotData(null);
+    setKioskVitalsRecorded(false);
+    closeStaffVitalsModal();
+    // Step-in never outlives the patient it was used for.
+    stepInPending.current = null;
+    setStepIn(null);
+    setShowStepInModal(false);
+    setKioskEmergencyPanelOpen(false);
+  };
+
+  const closeStaffVitalsModal = () => {
+    setShowStaffVitalsModal(false);
+    setStaffVitalsPin('');
+    setStaffVitalsUnlocked(false);
+    setStaffVitalsError('');
   };
 
   // Step 1 Handler: Patient Lookup by Phone / Walk-In Account Creation
@@ -278,7 +435,7 @@ function CareStationPage() {
     }
     setLookingUp(true);
     try {
-      const res = await aiIntakeApi.careStationPatientLookup({
+      const res = await patientApi.careStationPatientLookup({
         phone: lookupForm.phone.trim(),
         patientName: lookupForm.patientName.trim() || undefined,
         age: lookupForm.age ? Number(lookupForm.age) : undefined,
@@ -299,7 +456,7 @@ function CareStationPage() {
       // The lookup only finds/creates the patient. Open the real intake
       // session on the server; its id (also the consultation id) and desk
       // code are what every later step must use.
-      const walkInRes = await aiIntakeApi.registerWalkIn({
+      const walkInRes = await patientApi.registerWalkIn({
         patientName: resolvedName,
         phone: lookupForm.phone.trim(),
         age: lookupForm.age ? Number(lookupForm.age) : undefined,
@@ -376,13 +533,14 @@ function CareStationPage() {
     setSendingChat(true);
 
     try {
-      const res = await aiIntakeApi.walkInChat(activeSession.sessionId, {
+      const res = await patientApi.walkInChat(activeSession.sessionId, {
         message: messageText,
         vitals: vitalsForm.bp ? vitalsForm : undefined,
         structuredHx: structuredHxForm.chiefComplaint ? structuredHxForm : undefined,
       });
       const data = res?.data?.data ?? res?.data ?? {};
       const aiReply =
+        data.aiResponse ||
         data.reply ||
         data.message ||
         data.response ||
@@ -399,6 +557,7 @@ function CareStationPage() {
         },
       ]);
       setActiveSession((prev) => (prev ? { ...prev, intakeComplete: isComplete } : prev));
+      if (data.emergencyDetected) setEmergencySessionId(activeSession.sessionId);
     } catch (err) {
       setChatMessages((prev) => [
         ...prev,
@@ -440,32 +599,12 @@ function CareStationPage() {
     }
   };
 
-  // Kiosk (patient-operated): record booth vitals only. Clearing the patient for
-  // the doctor is a nurse decision, so the kiosk never calls nurseComplete.
-  const handleSaveKioskVitals = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeSession) return;
-    if (!(vitalsForm.bp || vitalsForm.temp || vitalsForm.hr || vitalsForm.spo2 || vitalsForm.weight)) {
-      toast.error('Enter at least one reading.');
-      return;
-    }
-    setSavingHxVitals(true);
-    try {
-      await aiIntakeApi.saveVitals(activeSession.sessionId, vitalsForm);
-      toast.success('Vitals recorded — a nurse will review them shortly.');
-    } catch (err) {
-      toast.error(actionErrorMessage(err, 'Vitals were NOT saved. Please try again.'));
-    } finally {
-      setSavingHxVitals(false);
-    }
-  };
-
   // Step 3A: Generate QR Code / 6-Char Phone Handoff Token
   const handleGenerateHandoff = async () => {
     if (!activeSession) return;
     setGeneratingHandoff(true);
     try {
-      const res = await aiIntakeApi.createHandoffToken(activeSession.sessionId);
+      const res = await patientApi.createHandoffToken(activeSession.sessionId);
       const data = res?.data?.data ?? res?.data ?? {};
       const rawCode = data.code || data.handoffCode;
       if (!rawCode) throw new Error('no handoff code returned');
@@ -487,12 +626,24 @@ function CareStationPage() {
   };
 
   // Step 3B: Launch In-Terminal Doctor Session
-  const handleLaunchTerminalDoctorSession = async () => {
+  // Sending a patient to the doctor queue is a clinical action: on a registered
+  // station it needs a staff step-in (the station token alone is refused).
+  const handleLaunchTerminalDoctorSession = () => {
+    if (!activeSession) return;
+    if (activeSession.sentToDoctor) {
+      void launchTerminalDoctorSession(patientApi);
+      return;
+    }
+    runWithStepIn(launchTerminalDoctorSession);
+  };
+
+  const launchTerminalDoctorSession = async (clinicalApi: CareStationIntakeApi) => {
     if (!activeSession) return;
     if (!activeSession.sentToDoctor) {
       try {
-        await aiIntakeApi.sendToDoctor(activeSession.sessionId);
+        await clinicalApi.sendToDoctor(activeSession.sessionId);
       } catch (err) {
+        if ((err as any)?.response?.status === 401) lockStepIn('Staff step-in expired. Step in again to continue.');
         toast.error(actionErrorMessage(err, 'The patient could not be sent to a doctor. Please try again.'));
         return;
       }
@@ -501,7 +652,7 @@ function CareStationPage() {
     setTerminalDoctorOpen(true);
 
     try {
-      const res = await aiIntakeApi.getTerminalSession(activeSession.consultationId);
+      const res = await patientApi.getTerminalSession(activeSession.consultationId);
       const data = res?.data?.data ?? res?.data ?? {};
       if (data.doctorName) setTerminalDoctorName(data.doctorName);
       if (data.status) setTerminalStatus(data.status);
@@ -599,7 +750,7 @@ function CareStationPage() {
     ]);
     setSendingTerminalMsg(true);
     try {
-      const res = await aiIntakeApi.sendTerminalMessage(activeSession.consultationId, {
+      const res = await patientApi.sendTerminalMessage(activeSession.consultationId, {
         content,
         action: 'message',
       });
@@ -856,9 +1007,13 @@ function CareStationPage() {
 
   // Kiosk Mode: End Patient Session & Clear Screen for Next Patient
   const handleKioskEndPatientSession = async () => {
+    // The escalation itself stays open for staff; only this screen is cleared.
+    setEmergencySessionId(null);
+    setKioskEmergencyPanelOpen(false);
+    setKioskEmergencyPinPrompt(false);
     if (activeSession && terminalDoctorOpen) {
       try {
-        await aiIntakeApi.sendTerminalMessage(activeSession.consultationId, {
+        await patientApi.sendTerminalMessage(activeSession.consultationId, {
           action: 'end_session',
         });
       } catch {
@@ -889,6 +1044,86 @@ function CareStationPage() {
     setUnlockError('');
   };
 
+  /** Check a Station PIN attempt. Returns an error message, or null when correct. */
+  const checkStationPin = async (rawAttempt: string): Promise<string | null> => {
+    const attempt = rawAttempt.trim();
+    const sessionPin = (stationConfig.stationPin || kioskPinSetup || '').trim();
+    if (sessionPin) {
+      return attempt === sessionPin ? null : 'Incorrect Station PIN. Kiosk remains locked.';
+    }
+    if (stationConfig.hasStationPin) {
+      try {
+        await adminApi.verifyCareStationPin(facilityId, attempt);
+        return null;
+      } catch (error) {
+        return actionErrorMessage(error, 'Incorrect Station PIN. Kiosk remains locked.');
+      }
+    }
+    return 'No Station PIN is set. Ask a site admin to unlock this station.';
+  };
+
+  // Kiosk: staff open the emergency action panel with the Station PIN.
+  const handleOpenKioskEmergencyPanel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const pinError = await checkStationPin(kioskEmergencyPin);
+    if (pinError) {
+      setKioskEmergencyPinError(pinError);
+      return;
+    }
+    setKioskEmergencyPin('');
+    setKioskEmergencyPinError('');
+    setKioskEmergencyPinPrompt(false);
+    setKioskEmergencyPanelOpen(true);
+  };
+
+  // Kiosk Step 2: staff unlock the vitals form with the Station PIN (kiosk stays locked).
+  const handleUnlockStaffVitals = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const pinError = await checkStationPin(staffVitalsPin);
+    if (pinError) {
+      setStaffVitalsError(pinError);
+      return;
+    }
+    setStaffVitalsError('');
+    setStaffVitalsPin('');
+    setStaffVitalsUnlocked(true);
+  };
+
+  // Kiosk Step 2: save vitals only. This must NOT complete the Hx — the
+  // patient still finishes the AI history (or staff complete it from the console).
+  const handleSaveStaffVitals = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeSession || !staffVitalsUnlocked) return;
+    const clinicalApi: CareStationIntakeApi | null = stationMode ? stepInIntakeApi : aiIntakeApi;
+    if (!clinicalApi) {
+      closeStaffVitalsModal();
+      runWithStepIn(() => {
+        setStaffVitalsUnlocked(true);
+        setShowStaffVitalsModal(true);
+      });
+      return;
+    }
+    if (!(vitalsForm.bp || vitalsForm.temp || vitalsForm.hr || vitalsForm.spo2 || vitalsForm.weight)) {
+      setStaffVitalsError('Enter at least one vital sign.');
+      return;
+    }
+    setSavingStaffVitals(true);
+    try {
+      await clinicalApi.saveVitals(activeSession.sessionId, vitalsForm);
+      setKioskVitalsRecorded(true);
+      closeStaffVitalsModal();
+      toast.success('Vitals recorded.');
+    } catch (err) {
+      if (stationMode && ((err as any)?.response?.status === 401 || readErrorCode((err as any)?.response?.data) === 'STAFF_STEP_IN_REQUIRED')) {
+        lockStepIn('Your step-in has expired. Step in again to save the vitals.');
+        return;
+      }
+      setStaffVitalsError(actionErrorMessage(err, 'Vitals were NOT saved. Please try again.'));
+    } finally {
+      setSavingStaffVitals(false);
+    }
+  };
+
   // Staff Unlock from Kiosk Mode
   const handleConfirmStaffUnlock = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -899,7 +1134,7 @@ function CareStationPage() {
         setUnlockError('Incorrect Station PIN. Kiosk remains locked.');
         return;
       }
-    } else if (stationConfig.hasStationPin && facilityId) {
+    } else if (stationConfig.hasStationPin) {
       try {
         await adminApi.verifyCareStationPin(facilityId, attempt);
       } catch (error) {
@@ -1002,24 +1237,94 @@ function CareStationPage() {
                 ✅ End My Session & Clear Screen for Next Patient
               </button>
             )}
-            <button
-              type="button"
-              data-testid="kiosk-staff-unlock-btn"
-              onClick={() => {
-                setShowUnlockModal(true);
-                setUnlockPinAttempt('');
-                setUnlockError('');
-              }}
-              className="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold border border-slate-700 flex items-center gap-1.5"
-            >
-              <Lock className="w-3.5 h-3.5 text-amber-400" />
-              🔒 Staff Unlock
-            </button>
+            {stationMode && stepIn ? (
+              <div
+                data-testid="kiosk-step-in-chip"
+                className="px-3.5 py-2 rounded-xl bg-amber-500/10 border border-amber-500/40 text-amber-200 text-xs font-semibold flex items-center gap-2"
+              >
+                <span>
+                  Stepped in: {stepIn.staff.name}
+                  <span className="ml-2 font-mono text-amber-300" aria-label="Time left">
+                    {Math.floor(stepInSecondsLeft / 60)}:{String(stepInSecondsLeft % 60).padStart(2, '0')}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  data-testid="kiosk-step-in-lock-btn"
+                  onClick={() => lockStepIn('Station locked.')}
+                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-white border border-slate-600"
+                >
+                  Lock
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                data-testid="kiosk-staff-unlock-btn"
+                onClick={() => {
+                  if (stationMode) {
+                    runWithStepIn(() => undefined);
+                    return;
+                  }
+                  setShowUnlockModal(true);
+                  setUnlockPinAttempt('');
+                  setUnlockError('');
+                }}
+                className="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold border border-slate-700 flex items-center gap-1.5"
+              >
+                <Lock className="w-3.5 h-3.5 text-amber-400" />
+                {stationMode ? 'Staff step-in' : '🔒 Staff Unlock'}
+              </button>
+            )}
           </div>
         </header>
 
         {/* Main Kiosk Body */}
         <main className="flex-1 max-w-4xl w-full mx-auto my-6 space-y-6">
+          {emergencySessionId && (
+            <div data-testid="kiosk-emergency-banner" className="rounded-3xl bg-red-600 p-5 md:p-6 shadow-2xl space-y-3">
+              <p className="text-xl md:text-2xl font-bold text-white">🚨 Please stay where you are.</p>
+              <p className="text-red-50">
+                Staff have been alerted and are coming to you now. If you feel worse, tell anyone nearby straight away.
+              </p>
+              {!kioskEmergencyPanelOpen && !kioskEmergencyPinPrompt && (
+                <button
+                  type="button"
+                  data-testid="kiosk-emergency-staff-btn"
+                  onClick={() => (stationMode
+                    ? runWithStepIn(() => setKioskEmergencyPanelOpen(true))
+                    : setKioskEmergencyPinPrompt(true))}
+                  className="px-4 py-2 rounded-xl bg-red-800 text-white text-sm font-semibold border border-red-400/40"
+                >
+                  🔒 Staff: open emergency panel
+                </button>
+              )}
+              {kioskEmergencyPinPrompt && (
+                <form onSubmit={handleOpenKioskEmergencyPanel} className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    autoFocus
+                    value={kioskEmergencyPin}
+                    onChange={(e) => setKioskEmergencyPin(e.target.value)}
+                    aria-label="Station PIN"
+                    placeholder="Station PIN"
+                    className="w-36 px-3 py-2 rounded-lg bg-white text-slate-900 text-sm"
+                  />
+                  <button type="submit" className="px-4 py-2 rounded-lg bg-white text-red-700 text-sm font-bold">Open</button>
+                  <button type="button" onClick={() => { setKioskEmergencyPinPrompt(false); setKioskEmergencyPinError(''); }} className="px-3 py-2 rounded-lg text-white text-sm">Cancel</button>
+                  {kioskEmergencyPinError && <p className="w-full text-sm text-white font-semibold">{kioskEmergencyPinError}</p>}
+                </form>
+              )}
+            </div>
+          )}
+          {emergencySessionId && kioskEmergencyPanelOpen && (
+            <EmergencyActionPanel
+              sessionId={emergencySessionId}
+              onClose={() => setKioskEmergencyPanelOpen(false)}
+              emergencyApi={stationMode ? stepInEmergencyApi : undefined}
+            />
+          )}
           {!activeSession ? (
             <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 md:p-10 shadow-2xl space-y-6">
               <div className="text-center space-y-2">
@@ -1195,53 +1500,75 @@ function CareStationPage() {
                   </form>
                 </div>
 
-                {/* Booth Vitals Entry */}
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
+                {/* Visit progress — patient-safe status only. Vitals are taken by
+                    staff (Station PIN), never typed by the patient on a shared screen. */}
+                <div
+                  data-testid="kiosk-visit-progress"
+                  className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4"
+                >
                   <h3 className="font-bold text-sm text-white flex items-center gap-2">
-                    <Activity className="w-4 h-4 text-rose-400" />
-                    Step 2: Station Booth Vitals
+                    <Activity className="w-4 h-4 text-teal-400" />
+                    Your Visit
                   </h3>
-                  <form onSubmit={handleSaveKioskVitals} className="space-y-3">
-                    <div>
-                      <label className="text-xs text-slate-400">Blood Pressure (mmHg)</label>
-                      <input
-                        type="text"
-                        placeholder="120/80"
-                        value={vitalsForm.bp}
-                        onChange={(e) => setVitalsForm({ ...vitalsForm, bp: e.target.value })}
-                        className="w-full mt-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm text-white"
-                      />
-                    </div>
-                    <div className="grid grid-cols-2 gap-2">
+                  <ol className="space-y-3 text-sm">
+                    <li className="flex items-start gap-2">
+                      <span className={activeSession.intakeComplete ? 'text-emerald-400' : 'text-teal-300'}>
+                        {activeSession.intakeComplete ? '✓' : '1'}
+                      </span>
                       <div>
-                        <label className="text-xs text-slate-400">Temp (°C)</label>
-                        <input
-                          type="text"
-                          placeholder="36.8"
-                          value={vitalsForm.temp}
-                          onChange={(e) => setVitalsForm({ ...vitalsForm, temp: e.target.value })}
-                          className="w-full mt-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm text-white"
-                        />
+                        <p className="font-semibold text-white">Symptoms &amp; history</p>
+                        <p className="text-xs text-slate-400">
+                          {activeSession.intakeComplete ? 'Done — thank you.' : 'Answer the questions on the left.'}
+                        </p>
                       </div>
+                    </li>
+                    <li className="flex items-start gap-2" data-testid="kiosk-vitals-status">
+                      <span className={kioskVitalsRecorded ? 'text-emerald-400' : 'text-slate-400'}>
+                        {kioskVitalsRecorded ? '✓' : '2'}
+                      </span>
                       <div>
-                        <label className="text-xs text-slate-400">SpO2 (%)</label>
-                        <input
-                          type="text"
-                          placeholder="98"
-                          value={vitalsForm.spo2}
-                          onChange={(e) => setVitalsForm({ ...vitalsForm, spo2: e.target.value })}
-                          className="w-full mt-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm text-white"
-                        />
+                        <p className="font-semibold text-white">Vitals check</p>
+                        <p className="text-xs text-slate-400">
+                          {kioskVitalsRecorded
+                            ? 'Recorded by staff.'
+                            : activeSession.intakeComplete
+                              ? 'Please wait — a staff member will check your blood pressure, temperature and oxygen level. You do not need to enter any measurements yourself.'
+                              : 'After your history, a staff member will check your vitals. You do not need to enter any measurements yourself.'}
+                        </p>
                       </div>
-                    </div>
-                    <button
-                      type="submit"
-                      disabled={savingHxVitals}
-                      className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-teal-300 font-semibold text-xs border border-teal-500/30"
-                    >
-                      {savingHxVitals ? 'Saving...' : 'Save Booth Vitals'}
-                    </button>
-                  </form>
+                    </li>
+                    <li className="flex items-start gap-2">
+                      <span className={activeSession.sentToDoctor ? 'text-emerald-400' : 'text-slate-400'}>
+                        {activeSession.sentToDoctor ? '✓' : '3'}
+                      </span>
+                      <div>
+                        <p className="font-semibold text-white">See a doctor</p>
+                        <p className="text-xs text-slate-400">
+                          Tap &ldquo;Talk to Doctor Here&rdquo; or continue on your phone.
+                        </p>
+                      </div>
+                    </li>
+                  </ol>
+                  <button
+                    type="button"
+                    data-testid="kiosk-staff-vitals-btn"
+                    onClick={() => {
+                      closeStaffVitalsModal();
+                      if (stationMode) {
+                        // Stepping in replaces the shared Station PIN.
+                        runWithStepIn(() => {
+                          setStaffVitalsUnlocked(true);
+                          setShowStaffVitalsModal(true);
+                        });
+                        return;
+                      }
+                      setShowStaffVitalsModal(true);
+                    }}
+                    className="w-full py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold border border-slate-700 flex items-center justify-center gap-1.5"
+                  >
+                    <Lock className="w-3.5 h-3.5 text-amber-400" />
+                    Staff: record vitals
+                  </button>
                 </div>
               </div>
 
@@ -1283,8 +1610,14 @@ function CareStationPage() {
                         {terminalDoctorName} · Status: {terminalStatus}
                       </h3>
                     </div>
-                    {/* No link out of the kiosk: navigating to /consultations would
-                        leave the PIN lock and hand the patient the staff session. */}
+                    <Link
+                      href={`/consultations/${activeSession.consultationId}/video?kiosk=1`}
+                      data-testid="kiosk-open-video-room"
+                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5"
+                    >
+                      <Video className="w-4 h-4" />
+                      Open Full Video Room
+                    </Link>
                   </div>
 
                   <div className="max-h-52 overflow-y-auto space-y-2">
@@ -1325,16 +1658,118 @@ function CareStationPage() {
                       Send to Doctor
                     </button>
                   </form>
-
-                  {/* The Co-Pilot (DDx / red flags) is clinician-only — never on the patient-facing kiosk. */}
+                  {/* No clinical co-pilot here: this is the patient-facing screen.
+                      DDx / red flags / SOAP live on the provider side only. */}
                 </div>
               )}
             </div>
           )}
         </main>
 
-        {/* Staff PIN Unlock Modal */}
-        {showUnlockModal && (
+        {/* Staff Vitals Modal \u2014 Station PIN first, then vitals (kiosk stays locked) */}
+        {showStaffVitalsModal && activeSession && (
+          <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="Staff vitals entry">
+            <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-sm w-full p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                  <HeartPulse className="w-5 h-5 text-rose-400" />
+                  Staff: Record Vitals
+                </h3>
+                <button
+                  type="button"
+                  onClick={closeStaffVitalsModal}
+                  className="text-slate-400 hover:text-white text-sm"
+                >
+                  Cancel
+                </button>
+              </div>
+              {!staffVitalsUnlocked ? (
+                <form onSubmit={handleUnlockStaffVitals} className="space-y-3">
+                  <p className="text-xs text-slate-400">
+                    Enter the Station PIN to record this patient&apos;s vitals. The kiosk stays locked.
+                  </p>
+                  <input
+                    type="password"
+                    data-testid="kiosk-staff-vitals-pin-input"
+                    maxLength={6}
+                    placeholder="Station PIN"
+                    value={staffVitalsPin}
+                    onChange={(e) => setStaffVitalsPin(e.target.value)}
+                    className="w-full px-4 py-3 rounded-xl bg-slate-950 border border-slate-700 text-center font-mono text-xl tracking-widest text-white"
+                  />
+                  {staffVitalsError && (
+                    <p data-testid="kiosk-staff-vitals-error" className="text-xs text-rose-400 font-medium">{staffVitalsError}</p>
+                  )}
+                  <button
+                    type="submit"
+                    data-testid="kiosk-staff-vitals-unlock-btn"
+                    className="w-full py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm"
+                  >
+                    Continue
+                  </button>
+                </form>
+              ) : (
+                <form onSubmit={handleSaveStaffVitals} className="space-y-3" data-testid="kiosk-staff-vitals-form">
+                  <div>
+                    <label className="text-xs text-slate-400">Blood Pressure (mmHg)</label>
+                    <input
+                      type="text"
+                      placeholder="120/80"
+                      value={vitalsForm.bp}
+                      onChange={(e) => setVitalsForm({ ...vitalsForm, bp: e.target.value })}
+                      className="w-full mt-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm text-white"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {([
+                      ['temp', 'Temp (\u00b0C)', '36.8'],
+                      ['hr', 'Pulse (bpm)', '78'],
+                      ['spo2', 'SpO2 (%)', '98'],
+                      ['weight', 'Weight (kg)', '70'],
+                    ] as const).map(([key, label, placeholder]) => (
+                      <div key={key}>
+                        <label className="text-xs text-slate-400">{label}</label>
+                        <input
+                          type="text"
+                          placeholder={placeholder}
+                          value={vitalsForm[key]}
+                          onChange={(e) => setVitalsForm({ ...vitalsForm, [key]: e.target.value })}
+                          className="w-full mt-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm text-white"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  {staffVitalsError && (
+                    <p data-testid="kiosk-staff-vitals-error" className="text-xs text-rose-400 font-medium">{staffVitalsError}</p>
+                  )}
+                  <button
+                    type="submit"
+                    data-testid="kiosk-staff-vitals-save-btn"
+                    disabled={savingStaffVitals}
+                    className="w-full py-3 rounded-xl bg-teal-500 hover:bg-teal-400 text-slate-950 font-bold text-sm"
+                  >
+                    {savingStaffVitals ? 'Saving\u2026' : 'Save Vitals'}
+                  </button>
+                </form>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Registered station: staff step in with their own PIN */}
+        {stationMode && showStepInModal && stationDeviceApi && (
+          <StaffStepInModal
+            deviceApi={stationDeviceApi}
+            onSuccess={handleStepInSuccess}
+            onClose={() => {
+              stepInPending.current = null;
+              setShowStepInModal(false);
+            }}
+          />
+        )}
+
+        {/* Staff PIN Unlock Modal (legacy shared Station PIN, unregistered devices only) */}
+        {!stationMode && showUnlockModal && (
           <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" role="dialog" aria-modal="true">
             <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-sm w-full p-6 space-y-4">
               <div className="flex items-center justify-between">
@@ -1421,6 +1856,17 @@ function CareStationPage() {
       }
     >
       <div className="space-y-6">
+        {emergencySessionId && (
+          <EmergencyActionPanel sessionId={emergencySessionId} onClose={() => setEmergencySessionId(null)} />
+        )}
+
+        {isSiteAdmin && activeMode !== 'settings' && (
+          <p data-testid="register-station-hint" className="text-xs text-gray-600 dark:text-slate-400 bg-teal-50 dark:bg-teal-900/20 border border-teal-200 dark:border-teal-800 rounded-xl px-3 py-2">
+            This device uses the shared Station PIN. Site admins can register it as a Care Station under Settings so
+            the kiosk runs without a staff login and each staff member steps in with their own PIN.
+          </p>
+        )}
+
         {/* Mode Switcher Tabs */}
         <div className="flex flex-wrap gap-2 border-b border-gray-200 dark:border-slate-800 pb-3">
           <button
@@ -1467,6 +1913,18 @@ function CareStationPage() {
         {/* ====================================================================
             MODE 3: SITE ADMIN CARE STATION & ROLE TOGGLE SETTINGS
             ==================================================================== */}
+        {activeMode === 'settings' && isSiteAdmin && (
+          <StationManagement
+            onDeviceRegistered={async () => {
+              // A shared kiosk never runs on a personal login: sign the admin
+              // out of this device, then open the station kiosk.
+              await authApi.logout().catch(() => undefined);
+              useAuthStore.setState({ user: null, isAuthenticated: false, mfaRequired: false, isSandbox: false });
+              window.location.assign('/care-station');
+            }}
+          />
+        )}
+
         {activeMode === 'settings' && isSiteAdmin && (
           <Card data-testid="care-station-admin-settings-card">
             <CardHeader>
@@ -2154,8 +2612,8 @@ function CareStationPage() {
                           </Button>
                         </form>
 
-                        {/* Meta Muse Wonder Co-Pilot Panel */}
-                        {renderCopilotPanel(false)}
+                        {/* Meta Muse Wonder Co-Pilot Panel — clinical roles only */}
+                        {canSeeClinicalCopilot && renderCopilotPanel(false)}
                       </div>
                     )}
                   </CardContent>
@@ -2169,7 +2627,7 @@ function CareStationPage() {
   );
 }
 
-export default withRoleGuard(CareStationPage, [
+const GuardedCareStationPage = withRoleGuard(CareStationPage, [
   'pharmacist',
   'pharmacy_admin',
   'medicine_store_attendant',
@@ -2184,3 +2642,80 @@ export default withRoleGuard(CareStationPage, [
   'admin',
   'super_admin',
 ]);
+
+/**
+ * Page entry. A device holding a valid station token runs the kiosk with no
+ * staff signed in (the role guard is bypassed — the station token is the
+ * credential). Every other device keeps the signed-in staff console.
+ */
+export default function CareStationEntry() {
+  const [phase, setPhase] = useState<'checking' | 'station' | 'staff' | 'revoked' | 'error'>('checking');
+  const [station, setStation] = useState<RegisteredStation | undefined>();
+  const [retry, setRetry] = useState(0);
+
+  useEffect(() => {
+    const token = getStationToken();
+    if (!token) {
+      setPhase('staff');
+      return;
+    }
+    let cancelled = false;
+    setPhase('checking');
+    makeCareStationDeviceApi(createCareStationClient(token))
+      .me()
+      .then((res) => {
+        if (cancelled) return;
+        const data = res?.data?.data;
+        if (!data?.stationId || !data?.facilityId) throw new Error('Unexpected station response');
+        setStation({ token, stationId: data.stationId, facilityId: data.facilityId });
+        setPhase('station');
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        const status = err?.response?.status;
+        if (status === 401 || status === 403) {
+          // Revoked (or no longer valid): forget the token so the device is not stuck.
+          clearStationToken();
+          setPhase('revoked');
+        } else {
+          setPhase('error');
+        }
+      });
+    return () => { cancelled = true; };
+  }, [retry]);
+
+  if (phase === 'checking') {
+    return (
+      <main className="min-h-screen bg-slate-950 text-slate-300 flex items-center justify-center">
+        <p className="text-sm">Starting Care Station…</p>
+      </main>
+    );
+  }
+  if (phase === 'revoked' || phase === 'error') {
+    return (
+      <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4">
+        <div data-testid="station-unavailable" className="max-w-md text-center space-y-4">
+          <h1 className="text-xl font-bold">
+            {phase === 'revoked' ? 'This Care Station has been switched off' : 'Cannot reach the Care Station service'}
+          </h1>
+          <p className="text-sm text-slate-400">
+            {phase === 'revoked'
+              ? 'A site admin has revoked this device. Ask them for a new enrollment code to register it again.'
+              : 'Check the internet connection and try again.'}
+          </p>
+          {phase === 'error' ? (
+            <button type="button" onClick={() => setRetry((n) => n + 1)} className="px-4 py-2 rounded-xl bg-teal-500 text-slate-950 font-bold text-sm">
+              Try again
+            </button>
+          ) : (
+            <Link href="/care-station/enroll" className="inline-block px-4 py-2 rounded-xl bg-teal-500 text-slate-950 font-bold text-sm">
+              Register this device again
+            </Link>
+          )}
+        </div>
+      </main>
+    );
+  }
+  if (phase === 'station' && station) return <CareStationPage stationMode={station} />;
+  return <GuardedCareStationPage />;
+}

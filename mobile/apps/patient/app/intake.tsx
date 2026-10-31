@@ -88,7 +88,7 @@ export default function IntakeScreen() {
   const [completeness, setCompleteness] = useState(0);
   const [isComplete, setIsComplete] = useState(false);
   const [completeSheet, setCompleteSheet] = useState(false);
-  const [emergency, setEmergency] = useState<{ shown: boolean; reason?: string }>({ shown: false });
+  const [emergency, setEmergency] = useState<{ shown: boolean; reason?: string; result?: IntakeMessageResult }>({ shown: false });
   const [joining, setJoining] = useState(false);
 
   // Meta Multimodal Assistant Sheet state (NAFDAC Medicine Check + SAM 3.1 Clinical Vision)
@@ -124,6 +124,7 @@ export default function IntakeScreen() {
       try {
         let guestHandoff: {
           sessionId?: string;
+          guestToken?: string | null;
           messages?: Msg[];
           triage?: IntakeMessageResult['triage'] | null;
           completeness?: number;
@@ -147,22 +148,54 @@ export default function IntakeScreen() {
         }
 
         const dep = useActiveProfile.getState().dependentId();
-        const c = await consultationsApi.create({
-          type: 'telehealth',
-          reason: guestHandoff?.chiefComplaint || 'AI symptom check',
-          ...(guestHandoff?.sessionId ? { intakeSessionId: guestHandoff.sessionId } : {}),
-          ...(dep ? { dependentId: dep } : {}),
-        });
-        const id = (c?.consultationId as string) ?? (c?.id as string);
+
+        // A guest symptom check continues on the SERVER: attaching copies the
+        // transcript/history into the new consultation, so the patient never
+        // repeats themselves and the doctor's brief has the full story.
+        let id: string | null = null;
+        let attached: Awaited<ReturnType<typeof intakeApi.attachGuest>> | null = null;
+        if (guestHandoff?.sessionId && guestHandoff.guestToken && !dep) {
+          try {
+            attached = await intakeApi.attachGuest(guestHandoff.sessionId, guestHandoff.guestToken);
+            id = attached?.consultationId ?? null;
+          } catch {
+            attached = null; // fall back to a fresh consultation below
+          }
+        }
+        if (!id) {
+          // `type` must be one of video | chat | in_person (the server also
+          // accepts the legacy 'telehealth' and normalises it to video).
+          const c = await consultationsApi.create({
+            type: 'chat',
+            mode: 'instant',
+            symptoms: guestHandoff?.chiefComplaint ? [guestHandoff.chiefComplaint] : [],
+            // Attach failed (or booking for a dependent): still link the guest
+            // session so the server can carry the transcript forward.
+            ...(guestHandoff?.sessionId ? { intakeSessionId: guestHandoff.sessionId } : {}),
+            ...(dep ? { dependentId: dep } : {}),
+          });
+          id = (c?.consultationId as string) ?? (c?.id as string) ?? null;
+        }
         if (!cancelled) {
           if (id) {
             setConsultationId(id);
-            if (guestHandoff?.messages?.length) {
-              setMessages(guestHandoff.messages);
-              if (guestHandoff.triage) setTriage(guestHandoff.triage);
-              if (typeof guestHandoff.completeness === 'number') setCompleteness(guestHandoff.completeness);
-              if (guestHandoff.language) setLanguage(guestHandoff.language);
-              if (guestHandoff.isComplete) {
+            const serverMessages: Msg[] | null = attached?.messages?.length
+              ? attached.messages.map((m, i) => ({
+                  id: `srv_${i}`,
+                  role: m.role,
+                  text: m.content,
+                }))
+              : null;
+            const restoredMessages = serverMessages ?? guestHandoff?.messages ?? null;
+            if (restoredMessages?.length) {
+              setMessages(restoredMessages);
+              const triageFromServer = attached?.triage?.category ? (attached.triage as IntakeMessageResult['triage']) : null;
+              if (triageFromServer || guestHandoff?.triage) setTriage(triageFromServer ?? guestHandoff!.triage ?? null);
+              const pct = typeof attached?.completeness === 'number' ? attached.completeness : guestHandoff?.completeness;
+              if (typeof pct === 'number') setCompleteness(pct);
+              const lang = (attached?.language as Language | undefined) ?? guestHandoff?.language;
+              if (lang) setLanguage(lang);
+              if (attached?.isComplete || guestHandoff?.isComplete) {
                 setIsComplete(true);
                 setTimeout(() => setCompleteSheet(true), 400);
               }
@@ -264,7 +297,7 @@ export default function IntakeScreen() {
         if (typeof res.completeness === 'number') setCompleteness(res.completeness);
         const isEmergency = res.emergencyEscalation === true || res.triage?.category === 'emergency';
         if (isEmergency) {
-          setEmergency({ shown: true, reason: res.triage?.reason });
+          setEmergency({ shown: true, reason: res.triage?.reason, result: res });
         }
         if (res.isComplete) {
           setIsComplete(true);
@@ -345,16 +378,19 @@ export default function IntakeScreen() {
       router.push('/landing?redirect=/intake');
       return;
     }
-    if (!authUser.phoneVerified) {
-      haptic.warning();
-      toast.info('Verify your phone number to connect with a doctor');
-      router.push('/profile/identity-verification');
-      return;
-    }
+    // Phone verification happens at sign-up (phone + OTP); it is never a gate
+    // between a finished intake and a doctor (owner: under 5 minutes to care).
     setJoining(true);
     try {
       const symptoms = messages.find((m) => m.role === 'user')?.text;
-      await queueApi.join({ symptoms, urgencyLevel: triage?.category, preferredLanguage: language });
+      // The consultation already has its queue row; passing its id flips that
+      // row to `waiting` instead of creating an unlinked duplicate.
+      await queueApi.join({
+        symptoms,
+        urgencyLevel: triage?.category,
+        preferredLanguage: language,
+        ...(consultationId ? { consultationId } : {}),
+      });
       haptic.success();
       setCompleteSheet(false);
       router.replace('/queue');
@@ -370,7 +406,7 @@ export default function IntakeScreen() {
     } finally {
       setJoining(false);
     }
-  }, [messages, triage, language, router, toast]);
+  }, [messages, triage, language, consultationId, router, toast]);
 
   const tone = triageTone(triage?.category);
 
@@ -488,7 +524,7 @@ export default function IntakeScreen() {
       >
         <Text style={{ fontSize: 14 }}>⚠️</Text>
         <Text variant="caption" style={{ flex: 1, color: theme.color.warning, fontFamily: theme.fontFamily.semibold }}>
-          This is not a medical diagnosis. For emergencies, call 112 or go to your nearest hospital.
+          This is not a medical diagnosis. If this is an emergency, go to the nearest hospital emergency room now — with someone taking you.
         </Text>
       </View>
 
@@ -904,6 +940,11 @@ export default function IntakeScreen() {
       <EmergencyInterstitial
         visible={emergency.shown}
         reason={emergency.reason}
+        directive={emergency.result?.emergencyDirective}
+        firstAid={emergency.result?.firstAid}
+        locationContext={emergency.result?.locationContext}
+        nearestFacilities={emergency.result?.nearestEmergencyFacilities}
+        emergencySessionId={consultationId}
         onClose={() => setEmergency((e) => ({ ...e, shown: false }))}
         onFindFacilities={() => {
           setEmergency((e) => ({ ...e, shown: false }));

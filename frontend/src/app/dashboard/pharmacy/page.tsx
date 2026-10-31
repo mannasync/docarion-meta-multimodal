@@ -27,7 +27,7 @@ interface Prescription {
     patientName?: string;
     status: string;
     medications: { name: string; dosage: string; quantity: number }[];
-    createdAt: string;
+    createdAt: TicketDateInput;
     workflowStatus?: string;
 }
 
@@ -49,6 +49,8 @@ interface MedHistoryEntry {
 
 import FacilityOnboardingChecklist from '@/components/onboarding/FacilityOnboardingChecklist';
 import { usePharmacyLicence } from './_lib/usePharmacyLicence';
+import { prescriptionPatientLabel, formatPrescriptionDate, prescriptionInPeriod } from './_lib/prescriptionQueue';
+import type { TicketDateInput } from '@/lib/tickets';
 
 function PharmacyDashboard() {
     const { user } = useAuthStore();
@@ -299,22 +301,10 @@ function PharmacyDashboard() {
         if (filters.search) {
             const term = filters.search.toLowerCase();
             const matchId = p.prescriptionId.toLowerCase().includes(term);
-            const matchName = p.patientName?.toLowerCase().includes(term);
+            const matchName = prescriptionPatientLabel(p).toLowerCase().includes(term);
             if (!matchId && !matchName) return false;
         }
-        if (filters.date) {
-            const today = new Date();
-            const pDate = new Date(p.createdAt);
-            if (filters.date === 'today') {
-                if (pDate.toDateString() !== today.toDateString()) return false;
-            } else if (filters.date === 'week') {
-                const diffTime = Math.abs(today.getTime() - pDate.getTime());
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); 
-                if (diffDays > 7) return false;
-            } else if (filters.date === 'month') {
-                if (pDate.getMonth() !== today.getMonth() || pDate.getFullYear() !== today.getFullYear()) return false;
-            }
-        }
+        if (filters.date && !prescriptionInPeriod(p.createdAt, filters.date)) return false;
         if (filters.priority) {
             // Priority filtering logic if applicable. Currently status handles 'active'.
         }
@@ -323,7 +313,7 @@ function PharmacyDashboard() {
 
     const columns: Column<Prescription>[] = [
         { header: 'Prescription ID', accessorKey: 'prescriptionId', cell: (p) => <span className="font-medium">#{p.prescriptionId.slice(0, 8)}</span> },
-        { header: 'Patient', accessorKey: 'patientName', cell: (p) => p.patientName || 'Unknown' },
+        { header: 'Patient', accessorKey: 'patientName', cell: (p) => prescriptionPatientLabel(p) },
         { header: 'Medications', accessorKey: 'medications', cell: (p) => (
             <div className="flex flex-wrap gap-1">
                 {p.medications.slice(0, 2).map((med, i) => (
@@ -334,7 +324,7 @@ function PharmacyDashboard() {
                 {p.medications.length > 2 && <span className="text-xs text-gray-500 dark:text-gray-400">+{p.medications.length - 2} more</span>}
             </div>
         )},
-        { header: 'Date', accessorKey: 'createdAt', cell: (p) => new Date(p.createdAt).toLocaleDateString() },
+        { header: 'Date', accessorKey: 'createdAt', cell: (p) => formatPrescriptionDate(p.createdAt) },
         { header: 'Actions', accessorKey: 'actions', cell: (p) => (
             <div className="flex gap-2">
                 <Button size="sm" variant="outline" className="text-xs" onClick={(e) => { e.stopPropagation(); viewMedHistory(p.patientId); }}>📋 History</Button>

@@ -10,11 +10,10 @@ import { scrubPHI } from './phi-scrubber.service';
 // mis-gated Gemini client — the co-pilot no longer silently disables
 // itself when only a non-Gemini provider is configured.
 //
-// NOTE: this service is TRANSPORT-dependent — it streams suggestions back
-// to the doctor over a WebSocket `emitter`. Sockets are dead in the current
-// Firebase-Functions deployment, so live co-pilot needs dedicated WS infra
-// (Cloud Run or equivalent) before it functions in production. That transport
-// gap is out of scope here and intentionally NOT addressed in this change.
+// NOTE: the session/emitter API below is the legacy WebSocket transport, which
+// cannot run in the Firebase-Functions deployment. Production uses the HTTP
+// live scribe (routes/live-scribe.routes.ts → services/live-scribe.service.ts)
+// which calls the stateless `analyzeTranscriptText` export.
 // ------------------------------------------------------------
 
 const DEBOUNCE_MS = 30_000; // 30 seconds after last transcript update
@@ -65,6 +64,27 @@ interface CopilotSession {
 }
 
 const sessions = new Map<string, CopilotSession>();
+
+/**
+ * Stateless co-pilot analysis of a consultation transcript (used by the HTTP
+ * live scribe). The transcript is identifiable free text, so it is ALWAYS run
+ * through the central PHI scrubber (plus any known identifiers for this
+ * consultation, e.g. the participants' names) before the model sees it.
+ * Returns null when there is nothing to analyse or no model is configured.
+ */
+export async function analyzeTranscriptText(
+    transcript: string,
+    knownIdentifiers: unknown[] = [],
+): Promise<CopilotAnalysis | null> {
+    if (!transcript || !transcript.trim()) return null;
+    if (!AI_PROVIDERS.anyAvailable()) return null;
+    const safeTranscript = scrubPHI(transcript.slice(-MAX_TRANSCRIPT_LENGTH), knownIdentifiers);
+    const result = await aiCoreService.generateStructured<CopilotAnalysis>([
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: `Transcript so far:\n${safeTranscript}` },
+    ], 3000);
+    return result || null;
+}
 
 async function analyzeTranscript(consultationId: string): Promise<CopilotAnalysis | null> {
     const session = sessions.get(consultationId);

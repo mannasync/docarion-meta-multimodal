@@ -11,6 +11,7 @@ import DashboardSkeleton from '@/components/ui/LoadingStates';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { DashboardShell } from '@/components/layout/DashboardShell';
+import { CredentialGateBanner } from '@/components/credential/CredentialGateBanner';
 import { withRoleGuard } from '@/components/shared/withRoleGuard';
 import { useAuthStore } from '@/store/auth.store';
 import FacilityOnboardingChecklist from '@/components/onboarding/FacilityOnboardingChecklist';
@@ -131,6 +132,8 @@ function RadiologyDashboardPage() {
         >
 
             <div className="container mx-auto px-4 py-6 md:px-6 space-y-6 pb-24">
+                {/* Licensure wall (P1-8): renders only when the radiographer's RRBN credential is incomplete. */}
+                <CredentialGateBanner />
                 {/* Facility setup checklist — the centre's own admin only. */}
                 {role === 'rad_admin' && facilityId && <FacilityOnboardingChecklist facilityId={facilityId} />}
 

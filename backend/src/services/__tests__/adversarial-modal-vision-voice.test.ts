@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { samVisionService, stripBase64ImagePrefix } from '../sam-vision.service';
-import { callVoiceDiarizationService, stripBase64AudioPrefix } from '../call-voice-diarization.service';
+import { callVoiceDiarizationService, DiarizationUnavailableError, stripBase64AudioPrefix } from '../call-voice-diarization.service';
 import { phiScrubberService, inspectAndScrubPHI } from '../phi-scrubber.service';
 
 jest.mock('axios');
@@ -233,18 +233,30 @@ Patient: I have severe high fever of 39.5 C, dry cough, and chest tightness for 
             expect(result.headerStripRedacted).toBe(true);
         });
 
-        it('3.3: callVoiceDiarizationService handles Modal timeout on audio input and falls back to simulated turns', async () => {
+        // A failed speech service must never be papered over with a scripted
+        // consultation: that would write invented findings into a real record.
+        it('3.3: callVoiceDiarizationService fails honestly on a Modal timeout (no scripted transcript)', async () => {
             mockedAxios.post.mockRejectedValueOnce(new Error('timeout of 20000ms exceeded'));
 
-            const result = await callVoiceDiarizationService.diarizeConsultationAudio({
+            await expect(callVoiceDiarizationService.diarizeConsultationAudio({
                 audioBase64: 'AAAAHGZ0eXBtcDQyAAAAAW1wNDJtcDQxaXNvbQ==',
                 language: 'pidgin',
-            });
+            })).rejects.toBeInstanceOf(DiarizationUnavailableError);
+        });
 
-            expect(result.model).toBe('meta-sam-audio-local-engine');
-            expect(result.telemetry.endpoint).toBe('local-engine');
-            expect(result.turns.length).toBeGreaterThan(0);
-            expect(result.fullScrubbedTranscript).toBeTruthy();
+        it('3.3b: the scripted demo is returned only when demo mode is switched on, and is labelled', async () => {
+            mockedAxios.post.mockRejectedValueOnce(new Error('timeout of 20000ms exceeded'));
+            process.env.CALL_DIARIZE_DEMO_MODE = 'true';
+            try {
+                const result = await callVoiceDiarizationService.diarizeConsultationAudio({
+                    audioBase64: 'AAAAHGZ0eXBtcDQyAAAAAW1wNDJtcDQxaXNvbQ==',
+                    language: 'pidgin',
+                });
+                expect(result.demo).toBe(true);
+                expect(result.model).toBe('demo-script (not from this call)');
+            } finally {
+                delete process.env.CALL_DIARIZE_DEMO_MODE;
+            }
         });
 
         it('3.4: callVoiceDiarizationService handles Modal HTTP 502 Bad Gateway gracefully', async () => {
@@ -253,14 +265,10 @@ Patient: I have severe high fever of 39.5 C, dry cough, and chest tightness for 
                 message: 'Request failed with status code 502',
             });
 
-            const result = await callVoiceDiarizationService.diarizeConsultationAudio({
+            await expect(callVoiceDiarizationService.diarizeConsultationAudio({
                 audioBase64: 'data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA',
                 language: 'english',
-            });
-
-            expect(result.model).toBe('meta-sam-audio-local-engine');
-            expect(result.telemetry.endpoint).toBe('local-engine');
-            expect(result.turns.length).toBeGreaterThan(0);
+            })).rejects.toThrow(/not available/);
         });
     });
 });

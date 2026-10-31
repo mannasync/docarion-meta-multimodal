@@ -280,9 +280,12 @@ export function MetaMultimodalScanner({
         credentials: 'include',
         body: JSON.stringify({
           type: mode,
-          imageBase64:
-            image ||
-            'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+          // No clinician image → send the explicit preset sentinel, never a
+          // fabricated pixel disguised as a real upload. The backend
+          // (sam-vision.service stripBase64ImagePrefix) maps the sentinel to its
+          // synthetic preset image, so 1-click presets still run, while logs and
+          // audit can always tell a real clinical image from a demo preset.
+          imageBase64: image || 'placeholder_for_preset',
           referenceScaleMm: scale,
           consultationId,
           facilityLicenceClass,

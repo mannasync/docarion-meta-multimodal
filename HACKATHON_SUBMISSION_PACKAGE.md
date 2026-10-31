@@ -61,7 +61,7 @@ LIVE PRODUCTION LINKS & JUDGE ACCESS:
 • Public Bilingual Pidgin Intake Router (No Login): https://docarion.com/symptom-checker
 • Android APK (Patient v1.2.0): https://docarion.com/downloads/docarion-patient.apk
 • Android APK (Staff Pro v1.2.0): https://docarion.com/downloads/docarion-pro.apk
-• Apple TestFlight & Google Play Internal Testing: v1.2.0 live for both Docarion (com.docarion.app, iOS Build 26 / Android v19) and Docarion Pro (com.docarion.pro, iOS Build 17 / Android v12)
+• Apple TestFlight & Google Play Internal Testing: v1.2.0 live for both Docarion (com.docarion.app, iOS Build 32 / Android v19) and Docarion Pro (com.docarion.pro, iOS Build 22 / Android v12)
 • Judge Demo Accounts (Universal Password: Password123!):
   - PPMV Counter Attendant: attendant1@docarion.ppmv (/dashboard/pharmacy)
   - Walk-In Nurse Care Station: nurse1@docarion.clinic (/care-station)
@@ -69,6 +69,8 @@ LIVE PRODUCTION LINKS & JUDGE ACCESS:
   - Pharmacist: pharm1@docarion.pharmacy (/dashboard/pharmacy)
   - Lab Technician: tech1@docarion.laboratory (/dashboard/laboratory)
   - Radiology Technician: tech1@docarion.radiology (/dashboard/radiology)
+  - Care Home Nurse: nurse1@docarion.carehome (/dashboard/care-home)
+  - Hospital Admin: admin1@docarion.hospital (/dashboard/hospital)
   - Patient: patient1@docarion.clinic (/dashboard/patient)
 
 THE FIRSTHAND PROBLEM WE SOLVE:
@@ -86,7 +88,7 @@ Docarion does NOT give autonomous AI medical advice or diagnose patients. Instea
 WHAT WAS NEWLY BUILT DURING THIS HACKATHON (OCT 26 – NOV 4, 2026) — STARTUP TRACK DISCLOSURE:
 While Docarion provides the underlying EMR/telehealth foundation, 100% of the Meta Multimodal Architecture, GPU microservices, regulatory gates, and scanner interfaces below were newly built from scratch during this Hackathon:
 1. Unified Meta Model Router & Baseten Muse Spark Open Integration (`backend/src/services/ai-core.service.ts`): Task-tiered routing across Meta Muse Spark (`meta-models/muse-spark-open-1026` on Baseten + `meta-muse-spark`) and Meta Muse Wonder (`meta-muse-wonder`), coupled with a deterministic 14-category Nigerian PHI Scrubber and live PHI Scrubbing Receipts.
-2. Modal Serverless T4 GPU Microservice for Meta SAM 3.1 & Meta MMS-1B (`backend/modal/modal_sam_mms_app.py`): Live GPU endpoints performing zero-shot SAM 3.1 ROI segmentation (drug packs, Malaria Pf RDT strips, calibrated mm²/cm² wound planimetry, paper lab header redaction) and MMS-1B + Pyannote 3.1 2-way bilingual audio diarization.
+2. Modal Serverless T4 GPU Microservices for Meta SAM 3.1 & Meta MMS-1B (`scripts/modal_meta_open_weights.py`, `backend/modal/modal_mms_asr_app.py`, `backend/src/services/live-scribe-asr.service.ts`): Live GPU endpoints performing zero-shot SAM 3.1 ROI segmentation (drug packs, Malaria Pf RDT strips, calibrated mm²/cm² wound planimetry, paper lab header redaction) and Meta `facebook/mms-1b-all` + Pyannote 3.1 2-way bilingual audio diarization & live scribe transcription.
 3. NAFDAC Registry & PCN PPMV Dispensing Gatekeeper (`backend/src/services/nafdac-verification.service.ts`): Deterministic NAFDAC number extraction (`A4-xxxx`, `04-xxxx`), counterfeit anomaly flagging, PCN OTC vs. POM enforcement, and 1-Click Telehealth Doctor Escalation.
 4. SAM 3.1 Clinical Vision Service (`backend/src/services/sam-vision.service.ts`) & 2-Way Call Voice Diarization Service (`backend/src/services/call-voice-diarization.service.ts`).
 5. Muse Wonder Clinician Charting Co-Pilot & RLHF Flywheel (`backend/src/services/ai-copilot.service.ts`, `backend/src/routes/ai-intake.routes.ts`): Auto-drafts structured SOAP notes, WHO AWaRe antibiotic stewardship checks, and clinician accept/override/reject RLHF telemetry.
@@ -123,17 +125,17 @@ We built a 4-model, task-tiered Meta AI pipeline spanning the Meta Model API, Ba
    • Generates bilingual (English + Nigerian Pidgin) post-visit medication instructions and follow-up checklists from the clinician's signed treatment plan.
 
 2. Meta Muse Wonder (`meta-muse-wonder` / Llama 4 Maverick):
-   • Powers the Clinician Documentation & Stewardship Co-Pilot (`/api/v1/ai-intake/copilot-sync`). It synthesizes the patient's intake transcript, nursing vitals, and SAM 3.1 visual measurements into structured SOAP note drafts, ICD-10-CM administrative coding suggestions, and WHO AWaRe 2023 antibiotic stewardship alerts (flagging Watch/Reserve antibiotics before a prescription is signed).
+   • Powers the Clinician Documentation & Stewardship Co-Pilot (`/api/v1/ai-intake/:consultationId/copilot-sync`). It synthesizes the patient's intake transcript, nursing vitals, and SAM 3.1 visual measurements into structured SOAP note drafts, ICD-10-CM administrative coding suggestions, and WHO AWaRe 2023 antibiotic stewardship alerts (flagging Watch/Reserve antibiotics before a prescription is signed).
 
 3. Meta SAM 3.1 (`Segment Anything Model 3.1` deployed on Modal Serverless NVIDIA T4 GPU):
-   • Powers `/api/v1/ai-intake/sam-segment` across four specialized clinical & regulatory modes in ~400–650ms:
+   • Powers `/api/v1/ai-intake/vision/analyze` and `/api/v1/ai-intake/nafdac/verify` (`sam-vision.service.ts`) across four specialized clinical & regulatory modes in ~200–650ms:
      - `drug_pack`: Isolates pharmaceutical carton panels and NAFDAC number bounding boxes (`[x, y, w, h]`) for anti-counterfeit and PCN scope verification.
      - `rdt_strip`: Segments the Malaria Rapid Diagnostic Test cassette window, Control (`C`) line, and P. falciparum (`Pf`) test line for objective optical-density documentation.
      - `wound`: Segments chronic ulcer perimeters and tissue beds (granulating, sloughy, necrotic) against a 20mm reference marker to calculate calibrated surface area in `mm²` and `cm²` for longitudinal healing tracking.
      - `lab_sheet`: Detects and masks out the top patient-identifying demographic header strip on paper lab reports before text extraction, enforcing privacy-by-design.
 
 4. Meta MMS-1B (`facebook/mms-1b-all` deployed on Modal Serverless NVIDIA T4 GPU with Pyannote 3.1):
-   • Powers `/api/v1/ai-intake/call-diarize` for 2-way telehealth consultation audio. It separates `SPEAKER_DOCTOR` and `SPEAKER_PATIENT` turns while accurately transcribing West African accented English and Nigerian Pidgin code-switching, feeding a pre-LLM PHI scrubber before updating the clinician's live SOAP note draft.
+   • Powers `/api/v1/ai-intake/call-diarize` (`call-voice-diarization.service.ts`) and live consultation transcription (`live-scribe-asr.service.ts` + `backend/modal/modal_mms_asr_app.py`) for 2-way telehealth consultation audio. It separates `SPEAKER_DOCTOR` and `SPEAKER_PATIENT` turns while accurately transcribing West African accented English and Nigerian Pidgin, Hausa, Yoruba, and Igbo code-switching, feeding a pre-LLM PHI scrubber before updating the clinician's live SOAP note draft.
 ```
 
 ---
@@ -191,7 +193,7 @@ Baseten made deploying meta-models/muse-spark-open-1026 effortless with an OpenA
 | **Doctor (Telehealth & Clinic)** | `doc1@docarion.clinic` | `/dashboard/doctor` & `/consultations/[id]` | **Muse Wonder Clinical Co-Pilot** (Live ICD-10 DDx + SOAP Auto-Draft), **2-Way Call Voice Diarization**, **SAM 3.1 Vision Overlay**, and **RLHF Feedback Flywheel**. |
 | **Lab Technician** | `tech1@docarion.laboratory` | `/dashboard/laboratory` | **SAM 3.1 Malaria RDT Strip Reader** and **Paper Lab Sheet OCR** with automatic PHI header redaction. |
 | **Radiology Technician** | `tech1@docarion.radiology` | `/dashboard/radiology` | **SAM 3.1 Clinical Imaging ROI Segmentation** (`defaultTab="vision"`) and structured imaging findings extraction. |
-| **Care Home Nurse** | `nurse1@docarion.care_home` | `/dashboard/care-home` | Bedside **SAM 3.1 Pressure Ulcer / Wound Planimetry (`cm²`)**, resident vitals, and assisted intake. |
+| **Care Home Nurse** | `nurse1@docarion.carehome` | `/dashboard/care-home` | Bedside **SAM 3.1 Pressure Ulcer / Wound Planimetry (`cm²`)**, resident vitals, and assisted intake. |
 | **Hospital Admin** | `admin1@docarion.hospital` | `/dashboard/hospital` | **Live Doctor Coverage & SLA Board**, facility-wide AI telemetry, and 1-click on-duty doctor paging. |
 
 ---

@@ -7,6 +7,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Switch,
+  Alert,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import {
@@ -26,11 +27,20 @@ import {
 import {
   intakeApi,
   adminApi,
+  careStationApi,
+  careStationIntakeApi,
+  intakeEmergencyStepInApi,
+  getActiveStepIn,
+  useCareStationStore,
   useAuthStore,
   usePoll,
   getErrorMessage,
 } from '@docarion/core';
 import { BackNav } from '../components/BackNav';
+import { EmergencyActionCard } from '../components/EmergencyActionCard';
+import { StationStepInSheet } from '../components/StationStepInSheet';
+import { StepInBar } from '../components/StepInBar';
+import { CareStationsAdmin, canManageCareStations } from '../components/CareStationsAdmin';
 import { VitalInput } from '../components/VitalInput';
 import { vitalLevel } from '../lib/vitals';
 import { haptic } from '../lib/haptics';
@@ -91,10 +101,26 @@ export default function CareStationScreen() {
 
   const user = useAuthStore((s) => s.user);
   const facilityId = (user?.facilityId as string | undefined) ?? undefined;
+  // Red-flag emergency raised during this station's intake.
+  const [emergencySessionId, setEmergencySessionId] = useState<string | null>(null);
+
+  // ── Registered station device ────────────────────────────────────────────
+  // A device enrolled as a Care Station runs on its OWN token, never on a
+  // staff member's login. Clinical actions need a 10-minute step-in by a named
+  // staff member (their own PIN); patient-facing kiosk calls do not.
+  // Unregistered devices keep the original flow: signed-in staff + shared PIN.
+  const onStation = useCareStationStore((s) => s.stationToken !== null);
+  const stationInfo = useCareStationStore((s) => s.station);
+  const stepIn = useCareStationStore((s) => s.stepIn);
+  const lockStepIn = useCareStationStore((s) => s.lock);
+  const intake = onStation ? careStationIntakeApi : intakeApi;
+  const [stepInOpen, setStepInOpen] = useState(false);
+  // An action that was waiting on a step-in (e.g. "send to doctor" from the kiosk).
+  const afterStepIn = React.useRef<(() => void) | null>(null);
 
   // ── Mode & Kiosk PIN Lock State ───────────────────────────────────────────
   const [stationMode, setStationMode] = useState<StationMode>(
-    params.mode === 'kiosk' ? 'kiosk' : 'assisted',
+    onStation || params.mode === 'kiosk' ? 'kiosk' : 'assisted',
   );
   // PIN chosen by staff when locking this kiosk (this session only). Empty
   // means "use the facility's saved Station PIN", checked with the server.
@@ -107,9 +133,24 @@ export default function CareStationScreen() {
   const [unlockPinInput, setUnlockPinInput] = useState('');
   const [unlockError, setUnlockError] = useState('');
 
+  // A registered device checks its registration is still valid (revoked
+  // stations drop back to a normal, unregistered device).
+  useEffect(() => {
+    if (!onStation) return;
+    careStationApi.me().catch(() => {
+      // 401 STATION_REVOKED clears the registration inside the API layer.
+    });
+  }, [onStation]);
+
+  // Staff mode on a station only exists while someone is stepped in: expiry,
+  // Lock, or the end of a patient session drops the device back to the kiosk.
+  useEffect(() => {
+    if (onStation && stationMode === 'assisted' && !stepIn) setStationMode('kiosk');
+  }, [onStation, stationMode, stepIn]);
+
   // Hydrate facility Care Station PIN config if available
   useEffect(() => {
-    if (!facilityId) return;
+    if (onStation || !facilityId) return;
     adminApi
       .getCareStationConfig(facilityId)
       .then((cfg) => {
@@ -118,17 +159,31 @@ export default function CareStationScreen() {
       .catch(() => {
         // Offline / not permitted: staff must choose a PIN when locking.
       });
-  }, [facilityId]);
+  }, [facilityId, onStation]);
 
   // Intercept Android hardware back when locked in Shared Care Station Kiosk Mode
   useEffect(() => {
     if (stationMode !== 'kiosk') return;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      setUnlockSheetOpen(true);
+      if (onStation) setStepInOpen(true);
+      else setUnlockSheetOpen(true);
       return true;
     });
     return () => sub.remove();
-  }, [stationMode]);
+  }, [stationMode, onStation]);
+
+  /**
+   * Clinical actions on a station need a staff step-in. Returns true when
+   * someone is stepped in; otherwise opens the step-in sheet, remembers what to
+   * run afterwards, and returns false. Unregistered devices always pass.
+   */
+  const requireStepIn = (resume?: () => void): boolean => {
+    if (!onStation || getActiveStepIn()) return true;
+    afterStepIn.current = resume ?? null;
+    setStepInOpen(true);
+    toast.error('Step in with your name and PIN to continue');
+    return false;
+  };
 
   // ── Patient Lookup & Session State ────────────────────────────────────────
   const [phone, setPhone] = useState('');
@@ -283,7 +338,7 @@ export default function CareStationScreen() {
     (terminalOpen || (stationMode === 'kiosk' && kioskStep === 'terminal'));
 
   const terminalPoll = usePoll(
-    () => intakeApi.getTerminalSession(activeConsultationId),
+    () => intake.getTerminalSession(activeConsultationId),
     {
       interval: 5000,
       focused: shouldPollTerminal,
@@ -297,7 +352,7 @@ export default function CareStationScreen() {
     async (notifyBackend = false) => {
       if (notifyBackend && activeConsultationId) {
         try {
-          await intakeApi.sendTerminalMessage(activeConsultationId, {
+          await intake.sendTerminalMessage(activeConsultationId, {
             action: 'end_terminal_session',
           });
         } catch {
@@ -329,6 +384,8 @@ export default function CareStationScreen() {
       setTerminalOpen(false);
       setTerminalMsgInput('');
       setKioskStep('welcome');
+      // End of the patient session: the stepped-in staff member is signed off.
+      lockStepIn();
       haptic.select();
     },
     [activeConsultationId],
@@ -343,7 +400,7 @@ export default function CareStationScreen() {
     }
     setLookingUp(true);
     try {
-      const res = await intakeApi.careStationPatientLookup({
+      const res = await intake.careStationPatientLookup({
         phone: cleanPhone,
         patientName: patientName.trim() || undefined,
         age: age.trim() ? Number(age) : undefined,
@@ -452,7 +509,7 @@ export default function CareStationScreen() {
             }
           : undefined;
 
-      const res = await intakeApi.walkInChat(activeSession.sessionId, {
+      const res = await intake.walkInChat(activeSession.sessionId, {
         message: text,
         vitals: vitalsPayload,
       });
@@ -473,6 +530,10 @@ export default function CareStationScreen() {
             ? Math.round((rawComp as { percent: number }).percent)
             : Math.min(100, intakeCompleteness + 35);
 
+      if (res?.emergencyDetected === true) {
+        haptic.error();
+        setEmergencySessionId(activeSession.sessionId);
+      }
       setIntakeCompleteness(pct);
       if (res?.isComplete === true || pct >= 100) {
         setIntakeCompleted(true);
@@ -498,6 +559,7 @@ export default function CareStationScreen() {
   // ── Step 2B: Structured Hx & Vitals Save ──────────────────────────────────
   const handleSaveStructuredAndVitals = async () => {
     if (!activeSession) return;
+    if (!requireStepIn(() => void handleSaveStructuredAndVitals())) return;
     const complaint = presentingComplaint.trim() || chiefComplaint.trim();
     if (!complaint) {
       toast.error('Presenting complaint is required to complete Hx intake');
@@ -508,7 +570,7 @@ export default function CareStationScreen() {
     try {
       const hasAnyVitals = Boolean(bp.trim() || temp.trim() || hr.trim() || spo2.trim() || weight.trim());
       if (hasAnyVitals) {
-        await intakeApi.walkInVitals(activeSession.sessionId, {
+        await intake.walkInVitals(activeSession.sessionId, {
           ...(bp.trim() ? { bp: bp.trim() } : {}),
           ...(temp.trim() ? { temp: Number(temp) } : {}),
           ...(hr.trim() ? { hr: Number(hr) } : {}),
@@ -534,9 +596,9 @@ export default function CareStationScreen() {
       };
 
       if (activeSession.consultationId) {
-        await intakeApi.nurseComplete(activeSession.consultationId, structuredPayload);
+        await intake.nurseComplete(activeSession.consultationId, structuredPayload);
       } else {
-        await intakeApi.walkInChat(activeSession.sessionId, {
+        await intake.walkInChat(activeSession.sessionId, {
           message: `Chief complaint: ${complaint} (${symptomDuration.trim() || 'duration unspecified'}, ${severity}). ${hxNotes.trim()}`,
           structuredHx: structuredPayload,
         });
@@ -558,7 +620,7 @@ export default function CareStationScreen() {
     if (!activeSession) return;
     setGeneratingHandoff(true);
     try {
-      const res = await intakeApi.createHandoffToken(activeSession.sessionId);
+      const res = await intake.createHandoffToken(activeSession.sessionId);
       setHandoff(res);
       haptic.success();
       toast.success(`Phone handoff code generated: ${res.handoffCode}`);
@@ -604,9 +666,10 @@ export default function CareStationScreen() {
   // ── Step 3B & 3C: Send to Doctor Queue / Open Station Terminal ────────────
   const handleSendToDoctor = async (openStationTerminal: boolean) => {
     if (!activeSession) return;
+    if (!requireStepIn(() => void handleSendToDoctor(openStationTerminal))) return;
     setSendingToDoctor(true);
     try {
-      const res = (await intakeApi.walkInSend(activeSession.sessionId)) as
+      const res = (await intake.walkInSend(activeSession.sessionId)) as
         | Record<string, unknown>
         | undefined;
       const cid = String(
@@ -627,6 +690,9 @@ export default function CareStationScreen() {
         setTerminalOpen(true);
         if (stationMode === 'kiosk') {
           setKioskStep('terminal');
+          // The send is done and recorded against the staff member: sign them
+          // off so the patient is not left sitting at an unlocked station.
+          if (onStation) lockStepIn();
         }
         toast.success('Connected to Station Consultation Terminal');
       } else {
@@ -647,7 +713,7 @@ export default function CareStationScreen() {
     if (!content) return;
     setSendingTerminalMsg(true);
     try {
-      await intakeApi.sendTerminalMessage(activeConsultationId, { content });
+      await intake.sendTerminalMessage(activeConsultationId, { content });
       setTerminalMsgInput('');
       await terminalPoll.refresh();
     } catch (e) {
@@ -905,6 +971,11 @@ export default function CareStationScreen() {
             size="sm"
             fullWidth={false}
             onPress={() => {
+              if (onStation) {
+                afterStepIn.current = null;
+                setStepInOpen(true);
+                return;
+              }
               setUnlockError('');
               setUnlockPinInput('');
               setUnlockSheetOpen(true);
@@ -922,6 +993,15 @@ export default function CareStationScreen() {
             contentContainerStyle={{ paddingBottom: 32 }}
             {...keyboardScrollProps}
           >
+            {emergencySessionId ? (
+              <Card style={{ marginBottom: 12, backgroundColor: theme.triage.emergency.bg }}>
+                <Text variant="heading" style={{ color: '#fff' }}>🚨 Please stay where you are.</Text>
+                <Text variant="body" style={{ color: 'rgba(255,255,255,0.92)', marginTop: 4 }}>
+                  Staff have been alerted and are coming to you now. If you feel worse, tell anyone nearby straight away.
+                </Text>
+              </Card>
+            ) : null}
+
             {/* Kiosk Step 1: Phone Check-In */}
             {kioskStep === 'welcome' || !activeSession ? (
               <Card>
@@ -1082,6 +1162,11 @@ export default function CareStationScreen() {
                         onChangeText={setSymptomDuration}
                         placeholder="e.g. 3 days"
                       />
+                      {/* Patient-facing kiosk: vitals are optional and never prompted
+                          with example values, so nobody types numbers just to fill a form. */}
+                      <Text variant="caption" muted>
+                        Only enter these if you measured them today. If you don't know them, leave them blank — a nurse will take them for you.
+                      </Text>
                       <View style={{ flexDirection: 'row', gap: 10 }}>
                         <View style={{ flex: 1 }}>
                           <VitalInput
@@ -1089,7 +1174,7 @@ export default function CareStationScreen() {
                             unit="mmHg"
                             value={bp}
                             onChangeText={setBp}
-                            placeholder="120/80"
+                            placeholder="Leave blank if unsure"
                             level={vitalLevel('systolic', systolic)}
                           />
                         </View>
@@ -1100,7 +1185,7 @@ export default function CareStationScreen() {
                             value={temp}
                             onChangeText={setTemp}
                             keyboard="decimal-pad"
-                            placeholder="36.8"
+                            placeholder="Leave blank if unsure"
                             level={vitalLevel('temperature', temp)}
                           />
                         </View>
@@ -1149,9 +1234,21 @@ export default function CareStationScreen() {
           </ScrollView>
         </KeyboardAvoidingView>
 
-        {/* Staff PIN Unlock Modal */}
+        {/* Registered station: staff step in with their own PIN */}
+        <StationStepInSheet
+          visible={stepInOpen}
+          onClose={() => setStepInOpen(false)}
+          onSteppedIn={() => {
+            const resume = afterStepIn.current;
+            afterStepIn.current = null;
+            if (resume) resume();
+            else setStationMode('assisted');
+          }}
+        />
+
+        {/* Staff PIN Unlock Modal (unregistered devices only) */}
         <Sheet
-          visible={unlockSheetOpen}
+          visible={unlockSheetOpen && !onStation}
           onClose={() => setUnlockSheetOpen(false)}
           title="Staff Unlock — Exit Kiosk Mode"
           scroll={false}
@@ -1188,10 +1285,70 @@ export default function CareStationScreen() {
       scroll
       title="Care Station & Outpost"
       subtitle="Assisted Intake, Phone Handoff & Shared Kiosk Terminal"
-      headerLeft={<BackNav />}
+      headerLeft={onStation ? undefined : <BackNav />}
     >
-      {/* Kiosk Launcher Banner */}
-      <Card
+      {onStation ? <StepInBar /> : null}
+
+      {emergencySessionId ? (
+        <EmergencyActionCard
+          sessionId={emergencySessionId}
+          onDismiss={() => setEmergencySessionId(null)}
+          api={onStation ? intakeEmergencyStepInApi : undefined}
+        />
+      ) : null}
+
+      {/* Station accounts: site admins manage them from a signed-in session */}
+      {!onStation && canManageCareStations(user?.role as string | undefined) ? <CareStationsAdmin /> : null}
+
+      {onStation ? (
+        <Card style={{ marginBottom: 14, gap: 10 }}>
+          <Text variant="label">{stationInfo?.name ? `Station: ${stationInfo.name}` : 'Care Station'}</Text>
+          <Button
+            label="Lock station"
+            variant="outline"
+            onPress={() => {
+              lockStepIn();
+            }}
+          />
+          {canManageCareStations(stepIn?.staff.role) ? (
+            <>
+              <Text variant="caption" muted>
+                Removing the registration only affects this device. Revoke the station from a signed-in admin account to disable it everywhere.
+              </Text>
+              <Button
+                label="Remove station registration from this device"
+                variant="danger"
+                onPress={() =>
+                  Alert.alert(
+                    'Remove station registration?',
+                    'This device stops being a Care Station and staff will need to sign in again.',
+                    [
+                      { text: 'Cancel', style: 'cancel' },
+                      {
+                        text: 'Remove',
+                        style: 'destructive',
+                        onPress: () => {
+                          lockStepIn();
+                          void useCareStationStore.getState().clearStation();
+                          router.replace('/(auth)/login' as never);
+                        },
+                      },
+                    ],
+                  )
+                }
+              />
+            </>
+          ) : null}
+          <Button
+            label="Sign in with a staff account"
+            variant="ghost"
+            onPress={() => router.push('/(auth)/login' as never)}
+          />
+        </Card>
+      ) : null}
+
+      {/* Kiosk Launcher Banner (unregistered devices: lock behind the shared PIN) */}
+      {onStation ? null : <Card
         style={{
           marginBottom: 14,
           borderWidth: 1,
@@ -1215,7 +1372,7 @@ export default function CareStationScreen() {
             onPress={() => setPinSetupOpen(true)}
           />
         </View>
-      </Card>
+      </Card>}
 
       {/* Step 1: Patient Phone Lookup / Account Link */}
       <Card style={{ marginBottom: 14 }}>
@@ -1315,7 +1472,7 @@ export default function CareStationScreen() {
               options={[
                 { value: 'chat', label: '🤖 Assisted AI Chat' },
                 { value: 'structured', label: '📋 Structured Hx' },
-                { value: 'scan', label: '🔬 Meta AI Scanner' },
+                ...(onStation ? [] : [{ value: 'scan' as const, label: '🔬 Meta AI Scanner' }]),
               ]}
               style={{ marginBottom: 12 }}
             />
@@ -1670,8 +1827,8 @@ export default function CareStationScreen() {
         </View>
       ) : null}
 
-      {/* Claim Existing Handoff Code Card */}
-      <Card style={{ marginTop: 14, marginBottom: 24 }}>
+      {/* Claim Existing Handoff Code Card (needs a staff session) */}
+      {onStation ? null : <Card style={{ marginTop: 14, marginBottom: 24 }}>
         <Text variant="label" style={{ marginBottom: 4 }}>
           Resume via 6-Character Handoff Code
         </Text>
@@ -1696,7 +1853,17 @@ export default function CareStationScreen() {
             onPress={handleClaimHandoffCode}
           />
         </View>
-      </Card>
+      </Card>}
+
+      <StationStepInSheet
+        visible={stepInOpen}
+        onClose={() => setStepInOpen(false)}
+        onSteppedIn={() => {
+          const resume = afterStepIn.current;
+          afterStepIn.current = null;
+          resume?.();
+        }}
+      />
 
       {/* Sheet to confirm Staff Exit PIN before launching Kiosk Mode */}
       <Sheet

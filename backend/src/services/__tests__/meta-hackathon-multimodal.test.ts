@@ -231,11 +231,22 @@ describe('Meta Model API Hackathon Multimodal Engine', () => {
     });
 
     describe('4. Two-Way Call Voice Segregation & Diarization (call-voice-diarization.service)', () => {
+        it('refuses to invent a consultation when there is no audio or dialogue', async () => {
+            await expect(callVoiceDiarizationService.diarizeConsultationAudio({
+                consultationId: 'test_consult_123',
+                language: 'pidgin',
+            })).rejects.toThrow(/not available/);
+        });
+
         it('should segregate doctor and patient dialogue, scrub PII, and extract entities', async () => {
             const result = await callVoiceDiarizationService.diarizeConsultationAudio({
                 consultationId: 'test_consult_123',
                 language: 'pidgin',
                 stripNoise: true,
+                dialogue: `Patient: Doctor good afternoon. My phone is 08034567891. My body dey hot since Tuesday and my head dey burst.
+Doctor: Any vomiting or chills? What have you taken?
+Patient: Cold dey shake my body. I took Paracetamol yesterday.
+Doctor: We will start Artemether lumefantrine and check your PCV.`,
             });
 
             expect(result.noiseFiltered).toBe(true);

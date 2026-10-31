@@ -262,18 +262,18 @@ async function primaryChatBatch(
 
     // Direct Meta models (muse-wonder-1.0 / muse-spark-1.3) include internal reasoning_tokens
     // within max_completion_tokens, so ensure sufficient token headroom for structured JSON.
-    const completionTokens = usingOpenRouter
-        ? opts.maxTokens
-        : Math.max(opts.maxTokens * 4, 2048);
-
+    // OpenAI-compatible third parties (OpenRouter / Baseten / Fireworks) take `max_tokens`
+    // ONLY — Baseten rejects `max_completion_tokens` outright with HTTP 400
+    // ("Extra inputs are not permitted"), which silently broke every Baseten call.
     const body: Record<string, unknown> = {
         model: modelBatch[0],
         messages: chatMessages,
         temperature: opts.temperature,
-        max_completion_tokens: completionTokens,
     };
     if (usingOpenRouter) {
         body.max_tokens = opts.maxTokens;
+    } else {
+        body.max_completion_tokens = Math.max(opts.maxTokens * 4, 2048);
     }
     if (opts.json && usingOpenRouter) {
         body.response_format = { type: 'json_object' };
@@ -343,7 +343,7 @@ async function primaryChat(
     // Economy tier option 1: Baseten if configured ($100 credit + 2M TPM)
     if (tier === 'economy' && BASETEN_API_KEY) {
         try {
-            const basetenUrl = resolveBasetenChatUrl(process.env.BASETEN_API_URL);
+            const basetenUrl = resolveBasetenChatUrl(process.env.BASETEN_API_URL || process.env.BASETEN_BASE_URL);
             const basetenModel = (process.env.BASETEN_MODEL_ID || process.env.BASETEN_MODEL || DEFAULT_BASETEN_MODEL).trim();
             const candidateModels = [basetenModel, 'meta-models/muse-spark-open'].filter(
                 (m, idx, arr) => Boolean(m) && arr.indexOf(m) === idx
@@ -363,6 +363,7 @@ async function primaryChat(
                 } catch (bErr: any) {
                     lastErr = bErr;
                     noteModelFailure(model, bErr?.response?.status);
+                    log.warn(`AI Core: Baseten model [${model}] failed (${bErr?.response?.status || bErr?.message}) ${JSON.stringify(bErr?.response?.data || '').slice(0, 200)}`);
                 }
             }
         } catch (err: any) {
@@ -429,7 +430,7 @@ async function primaryChat(
     // Failover to Baseten hackathon endpoint if primary Meta models failed (or if PRIMARY_API_KEY is unset)
     if (BASETEN_API_KEY) {
         try {
-            const basetenUrl = resolveBasetenChatUrl(process.env.BASETEN_API_URL);
+            const basetenUrl = resolveBasetenChatUrl(process.env.BASETEN_API_URL || process.env.BASETEN_BASE_URL);
             const basetenModel = (process.env.BASETEN_MODEL_ID || process.env.BASETEN_MODEL || DEFAULT_BASETEN_MODEL).trim();
             const candidateModels = [basetenModel, 'meta-models/muse-spark-open'].filter(
                 (m, idx, arr) => Boolean(m) && arr.indexOf(m) === idx
@@ -449,6 +450,7 @@ async function primaryChat(
                 } catch (bErr: any) {
                     lastErr = bErr;
                     noteModelFailure(model, bErr?.response?.status);
+                    log.warn(`AI Core: Baseten model [${model}] failed (${bErr?.response?.status || bErr?.message}) ${JSON.stringify(bErr?.response?.data || '').slice(0, 200)}`);
                 }
             }
         } catch (err: any) {

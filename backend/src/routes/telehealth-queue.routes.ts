@@ -26,13 +26,21 @@ import { notifyQueueMilestoneOnWhatsApp } from '../services/wa-link.service';
 import { UserRole } from '../types';
 import { issueRecordIdentifierFields } from '../services/identifier.service';
 import { evaluateEncounterCloseGate } from '../services/encounter-billing-gate.service';
+import { collectConsultFeeAtCompletion, settleConsultOnComplete } from '../services/consult-billing.service';
 import { ensureEncounterForConsultation, transitionEncounterFromConsultation } from '../services/identifier-coverage.service';
 import { requireCompletedCredential } from '../middleware/credential-gate.middleware';
 import { filterCredentialedPrincipals } from '../services/credential-gate.service';
+import { resolveOnDutyDoctors, CENTRAL_SCOPE } from '../services/on-duty-doctors.service';
+import { centralRecordFacilityId, isDocarionCentralRecord, partnerSiteIdOf } from '../config/tenancy';
+import { compareDocsByField, getCentralDocs, isCentralScopeValue } from '../utils/central-site-query';
 import { requireMFA } from '../middleware/mfa.middleware';
 import { createOrGetEpisode, linkSourceToEpisode, getEpisodeBySource } from '../services/consultation-episode.service';
 import { activeFacilityContext, facilityContextRequiredBody, isPlatformPrincipal, platformCanSeeFacility } from '../utils/platform-facility-context';
-import { computePatientOnlinePresence } from '../utils/consultation-access';
+import { computePatientOnlinePresence, canDoctorServeConsultation, DoctorScope } from '../utils/consultation-access';
+import { resolveDoctorScope, resolveDoctorScopeFor, facilityUsesPlatformDoctorsAt } from '../services/doctor-scope.service';
+import { markQueueEntryIntakeComplete } from '../services/queue-entry.service';
+import { applyQueueDisposition } from '../services/queue-hygiene.service';
+import { resolveStaffDisplayNames } from '../services/staff-display-names.service';
 
 const router = Router();
 
@@ -78,19 +86,34 @@ router.use(requireMFA);
 export async function computePatientQueueStatus(patientId: string, dependentId?: string): Promise<any> {
     const snapshot = await collections.telehealthQueue
         .where('patientId', '==', patientId)
-        .where('status', 'in', ['waiting', 'assigned', 'in_consultation', 'diagnostics'])
+        .where('status', 'in', ['waiting', 'assigned', 'in_consultation', 'diagnostics', 'intake_pending'])
         .limit(5)
         .get();
 
-    const match = dependentId
-        ? snapshot.docs.find((d: any) => d.data()?.dependentId === dependentId)
-        : snapshot.docs[0];
+    const candidates = dependentId
+        ? snapshot.docs.filter((d: any) => d.data()?.dependentId === dependentId)
+        : snapshot.docs;
+    // Prefer a row that is actually in the queue over one still in intake.
+    const match = candidates.find((d: any) => d.data()?.status !== 'intake_pending') || candidates[0];
 
     if (!match) {
         return { inQueue: false };
     }
 
     const entry = match.data();
+
+    if (entry.status === 'intake_pending') {
+        // The patient is still answering the AI intake — not waiting for a
+        // doctor yet, so no position/SLA. Clients show "finish your check-in".
+        return {
+            inQueue: false,
+            intakePending: true,
+            queueId: entry.queueId || match.id,
+            status: 'intake_pending',
+            consultationId: entry.consultationId || null,
+            dependentId: entry.dependentId || null,
+        };
+    }
     const band: TriageBand = normalizeBand(entry.triageCategory || entry.urgencyLevel);
     const enqueuedAtMs = toMillis(entry.joinedAt) || Date.now();
     const engagedAtMs = entry.assignedAt ? toMillis(entry.assignedAt) : null;
@@ -189,6 +212,29 @@ export async function filterDoctorsAcceptingConsultations<T extends { userId?: s
  */
 router.post('/join', asyncHandler(async (req: AuthRequest, res: Response) => {
     const { symptoms, urgencyLevel, preferredLanguage, facilityId, dependentId } = req.body;
+    const linkedConsultationId = typeof req.body.consultationId === 'string' && req.body.consultationId.trim()
+        ? req.body.consultationId.trim()
+        : null;
+
+    // A consultation created through the AI intake already has its queue row
+    // (`intake_pending` until the intake completes). Joining with that id
+    // flips the existing row to `waiting` instead of creating a duplicate.
+    if (linkedConsultationId) {
+        const consultSnap = await collections.consultations.doc(linkedConsultationId).get();
+        const consult: any = consultSnap.exists ? consultSnap.data() : null;
+        if (!consult || consult.patientId !== req.user!.userId) {
+            return res.status(404).json({ success: false, error: 'Consultation not found' });
+        }
+        const flipped = await markQueueEntryIntakeComplete(linkedConsultationId);
+        if (flipped?.queueId) {
+            await logAudit(req, 'QUEUE_JOINED', 'telehealthQueue', flipped.queueId, {
+                details: { urgencyLevel: flipped.urgencyLevel, position: flipped.position, viaConsultation: true },
+            });
+            return res.status(200).json({ success: true, data: flipped, reusedExisting: true });
+        }
+        // No row could be created (claimed/closed consult): fall through to the
+        // standard "already in queue" check below.
+    }
 
     // Joining on behalf of a dependent (family member sub-profile): verify the
     // caller actually guards this dependent before tagging the queue entry.
@@ -241,7 +287,7 @@ router.post('/join', asyncHandler(async (req: AuthRequest, res: Response) => {
         is_sandbox: req.isSandbox || false,
         patientName: req.user!.email, // Will be enriched from user profile
         ...(dependentId ? { dependentId: String(dependentId), dependentName } : {}),
-        facilityId: facilityId || null,
+        facilityId: centralRecordFacilityId(facilityId || null),
         symptoms: symptoms || [],
         urgencyLevel: urgencyLevel || 'low',
         preferredLanguage: preferredLanguage || 'en',
@@ -294,7 +340,7 @@ router.post('/join', asyncHandler(async (req: AuthRequest, res: Response) => {
         // for a general telehealth consult (consultation complete = doctor,
         // prescription = doctor / anaesthesia). Central-platform queue: doctors
         // only, nobody else works it.
-        const joinedQueueRoles: UserRole[] = entry.facilityId
+        const joinedQueueRoles: UserRole[] = partnerSiteIdOf(entry.facilityId)
             ? ['doctor', 'clinic_admin', 'hospital_admin', 'nurse', 'receptionist' as any]
             : ['doctor', 'clinic_admin', 'hospital_admin'];
         notificationService.sendToFacilityStaff(
@@ -318,10 +364,10 @@ router.post('/join', asyncHandler(async (req: AuthRequest, res: Response) => {
         // Zero-Doctor Escalation Signal: when 0 doctors are online & accepting consultations,
         // escalate to facility admins (or platform admins for Central Network).
         try {
-            const rawPresence = (await doctorPresenceService.getAvailableDoctors?.(entry.facilityId || undefined)) || [];
+            const rawPresence = (await doctorPresenceService.getAvailableDoctors?.(partnerSiteIdOf(entry.facilityId) || undefined)) || [];
             const availableDoctors = await filterDoctorsAcceptingConsultations(rawPresence);
             if (availableDoctors.length === 0) {
-                const escalationRoles: UserRole[] = entry.facilityId
+                const escalationRoles: UserRole[] = partnerSiteIdOf(entry.facilityId)
                     ? ['doctor', 'hospital_admin', 'clinic_admin', 'admin']
                     : ['doctor', 'admin', 'super_admin'];
                 notificationService.sendToFacilityStaff?.(
@@ -353,9 +399,10 @@ router.post('/join', asyncHandler(async (req: AuthRequest, res: Response) => {
  * Patient leaves the queue (cancel).
  */
 router.delete('/leave', asyncHandler(async (req: AuthRequest, res: Response) => {
+    // A patient may also leave while still in the AI intake (`intake_pending`).
     const snapshot = await collections.telehealthQueue
         .where('patientId', '==', req.user!.userId)
-        .where('status', 'in', ['waiting', 'assigned'])
+        .where('status', 'in', ['waiting', 'assigned', 'intake_pending'])
         .limit(1)
         .get();
 
@@ -472,10 +519,9 @@ router.get('/sla-dashboard', authorize('doctor', 'nurse', 'midwife', 'care_home_
     const facilityId = queueReadScopeOr403(req, res);
     if (facilityId === undefined) return;
 
-    let query: any = collections.telehealthQueue.where('status', 'in', ['waiting', 'assigned', 'in_consultation', 'diagnostics']);
-    query = applyQueueScope(query, facilityId);
+    const baseQuery: any = collections.telehealthQueue.where('status', 'in', ['waiting', 'assigned', 'in_consultation', 'diagnostics']);
 
-    const snapshot = await query.limit(200).get();
+    const snapshot = await getScopedQueueDocs(baseQuery, facilityId, (q) => q.limit(200), { limit: 200 });
     const now = Date.now();
 
     const items = snapshot.docs.map((doc: any) => {
@@ -493,6 +539,12 @@ router.get('/sla-dashboard', authorize('doctor', 'nurse', 'midwife', 'care_home_
             triageBand: band,
             assignedDoctorId: e.assignedDoctorId || null,
             joinedAt: e.joinedAt,
+            assignedAt: e.assignedAt || null,
+            claimedAt: e.claimedAt || null,
+            startedAt: e.startedAt || null,
+            consultationId: e.consultationId || null,
+            routedVia: e.routedVia || null,
+            routedToPlatform: e.routedToPlatform === true,
             waitedMinutes: sla.elapsedMinutes,
             sla: {
                 state: sla.state,
@@ -512,9 +564,13 @@ router.get('/sla-dashboard', authorize('doctor', 'nurse', 'midwife', 'care_home_
         return b.waitedMinutes - a.waitedMinutes;
     });
 
-    const summary = summarizeSla(items.map((i: any) => ({ state: i.sla.state, band: i.triageBand })));
+    const decorated = await decorateQueueRows(items, req.user, null);
+    const summary = {
+        ...summarizeSla(decorated.map((i: any) => ({ state: i.sla.state, band: i.triageBand }))),
+        counts: countQueueRows(decorated),
+    };
 
-    res.json({ success: true, data: { queue: items, summary } });
+    res.json({ success: true, data: { queue: decorated, summary } });
 }));
 
 // ============================================================
@@ -567,6 +623,12 @@ class QueueFacilityContextError extends Error {
 }
 
 function resolveQueueReadFacility(req: AuthRequest): QueueReadScope {
+    const resolved = resolveQueueReadFacilityRaw(req);
+    // A Central site id ('docarion-central' / 'central') is the Central queue.
+    return isCentralScopeValue(resolved) ? CENTRAL_QUEUE : resolved;
+}
+
+function resolveQueueReadFacilityRaw(req: AuthRequest): QueueReadScope {
     const user = req.user!;
     const q = typeof req.query.facilityId === 'string' && req.query.facilityId ? req.query.facilityId : null;
     if (isPlatformQueueAdmin(user)) {
@@ -592,9 +654,29 @@ function resolveQueueReadFacility(req: AuthRequest): QueueReadScope {
 
 /** Apply a read scope to a Firestore query. */
 function applyQueueScope(query: any, scope: QueueReadScope): any {
-    if (scope === CENTRAL_QUEUE) return query.where('facilityId', '==', null);
+    // Central rows carry two encodings (null and 'docarion-central'); a single
+    // query cannot read both portably, so use getScopedQueueDocs for them.
+    if (scope === CENTRAL_QUEUE) throw new Error('Central queue scope must be read with getScopedQueueDocs');
     if (scope) return query.where('facilityId', '==', scope);
     return query;
+}
+
+/**
+ * Run a scoped queue read. A partner-site scope is one equality query; the
+ * Central scope reads both stored encodings of Central (null and
+ * 'docarion-central') and merges them. `finish` adds ordering/limit.
+ */
+async function getScopedQueueDocs(
+    base: any,
+    scope: QueueReadScope,
+    finish?: (q: any) => any,
+    opts: { compare?: (a: any, b: any) => number; limit?: number } = {},
+): Promise<{ docs: any[]; size: number; empty: boolean }> {
+    const run = (q: any) => (finish ? finish(q) : q);
+    if (scope === CENTRAL_QUEUE) {
+        return getCentralDocs((v) => run(base.where('facilityId', '==', v)), opts);
+    }
+    return run(applyQueueScope(base, scope)).get();
 }
 
 /** Resolve the read scope, answering 403 FACILITY_CONTEXT_REQUIRED on mismatch. */
@@ -618,10 +700,11 @@ function queueReadScopeOr403(req: AuthRequest, res: Response): QueueReadScope | 
  */
 function canActOnQueueEntry(user: AuthRequest['user'], entry: any): boolean {
     if (!user) return false;
-    const entryFacility = entry?.facilityId || null;
+    // Central rows are null-site or 'docarion-central': both are "Central".
+    const entryFacility = partnerSiteIdOf(entry?.facilityId);
     // Platform admins: unrestricted across entries (WALL-GAP-4)
     if (isPlatformQueueAdmin(user)) return true;
-    if (user.facilityId) return entryFacility === user.facilityId;
+    if (user.facilityId) return entryFacility === partnerSiteIdOf(user.facilityId);
     return entryFacility === null;
 }
 
@@ -636,44 +719,196 @@ function isAssignedDoctor(user: AuthRequest['user'], entry: any): boolean {
 }
 
 /**
- * Doctor-to-doctor separation. Once a colleague has taken a patient, another
- * doctor may neither act on that queue entry (complete / release / no-show /
- * bulk-update) nor read the patient's identity or symptoms from the queue.
- * Facility scope alone ("same hospital") is not enough — that let Doctor B end
- * or hand back Doctor A's live consultation. Nurses and administrators keep
- * their existing facility-scoped queue powers.
+ * A doctor who could CLAIM this entry (the one scope predicate, visibility ==
+ * claimability) may also dispose of it: no-show / cannot reach / requeue.
+ * Before this, a doctor could see a row via `canDoctorServeConsultation` and
+ * then get QUEUE_SCOPE_DENIED on the row's actions (audit 2026-10-29 Q2).
  */
-function isAnotherDoctorsPatient(user: AuthRequest['user'], entry: any): boolean {
-    return !!user && user.role === 'doctor' && !!entry?.assignedDoctorId && entry.assignedDoctorId !== user.userId;
+async function canDoctorServeEntry(user: AuthRequest['user'], entry: any): Promise<boolean> {
+    if (!user || user.role !== 'doctor') return false;
+    const scope = await resolveDoctorScope(user);
+    return canDoctorServeEntryWith(scope, entry, (fid) => facilityUsesPlatformDoctorsAt(fid).catch(() => false));
 }
 
-/** Uniform 403 for a doctor acting on a colleague's patient. */
-function denyAnotherDoctorsPatient(res: Response): Response {
+/** The claim predicate over an ALREADY-RESOLVED scope (row projection resolves it once per request). */
+async function canDoctorServeEntryWith(
+    scope: DoctorScope,
+    entry: any,
+    facilityUsesPlatform: (facilityId: string) => Promise<boolean>,
+): Promise<boolean> {
+    const fid = partnerSiteIdOf(entry?.facilityId);
+    return canDoctorServeConsultation(scope, {
+        facilityId: fid,
+        doctorId: entry?.assignedDoctorId || null,
+        status: entry?.status || null,
+        routedVia: entry?.routedVia || null,
+        routedToPlatform: entry?.routedToPlatform === true,
+        facilityUsesPlatformDoctors: fid ? await facilityUsesPlatform(fid) : false,
+    }).ok;
+}
+
+/** Tenancy OR holds it OR could claim it. */
+async function canMutateQueueEntry(user: AuthRequest['user'], entry: any): Promise<boolean> {
+    return canActOnQueueEntry(user, entry) || isAssignedDoctor(user, entry) || (await canDoctorServeEntry(user, entry));
+}
+
+/** Per-row claim state so boards can disable the button with the reason before the click (audit Q3). */
+function withClaimState(entry: any, userId: string | undefined) {
+    const status = String(entry?.status || '');
+    let claimBlockedReason: string | null = null;
+    if (status !== 'waiting') {
+        claimBlockedReason = entry?.assignedDoctorId && entry.assignedDoctorId === userId ? 'assigned_to_you'
+            : status === 'assigned' ? 'already_claimed'
+            : status === 'in_consultation' ? 'in_consultation'
+            : status === 'intake_pending' ? 'intake_in_progress'
+            : status;
+    }
+    return { ...entry, canClaim: claimBlockedReason === null, claimBlockedReason };
+}
+
+/**
+ * Owner rule: a patient in consultation with one doctor is never releasable,
+ * completable or disposable by ANOTHER doctor. Platform admins (and facility
+ * admins / nurses acting through their tenancy) are not "another doctor" and
+ * keep their administrative reach.
+ */
+function heldByAnotherDoctor(user: AuthRequest['user'], entry: any): boolean {
+    if (!user || user.role !== 'doctor' || isPlatformQueueAdmin(user)) return false;
+    return ['assigned', 'in_consultation'].includes(String(entry?.status))
+        && !!entry?.assignedDoctorId
+        && entry.assignedDoctorId !== user.userId;
+}
+
+/** Uniform 403 for a mutation on a patient another doctor is seeing. */
+function denyHeldByAnotherDoctor(res: Response): Response {
     return res.status(403).json({
         success: false,
-        error: 'This patient is already with another doctor',
+        error: 'This patient is in consultation with another doctor',
         code: 'ASSIGNED_TO_ANOTHER_DOCTOR',
     });
 }
 
 /**
- * What a doctor sees of a colleague's engaged queue entry: enough for the board
- * to show "in consultation" and keep counts right — no name, symptoms,
- * dependent or patient id.
+ * What a DOCTOR sees of a colleague's engaged queue row: enough for the board
+ * to show "being seen now" and keep its counts (status, timing, holder) — no
+ * name, symptoms, dependent or patient id. Nurses, facility admins and
+ * platform admins keep full rows (their tenancy already covers the patient).
  */
+const REDACTED_QUEUE_FIELDS = [
+    'patientId', 'patientEmail', 'patientPhone', 'patientAvatar', 'patientAge', 'patientGender', 'patientDob',
+    'dependentId', 'dependentName', 'chiefComplaint', 'notes', 'reason', 'intakeSummary', 'triageReason',
+    'patient', 'patientProfile', 'medicalHistory', 'vitals',
+] as const;
+
 function redactForOtherDoctor(entry: any): any {
+    // Keep board state and the computed flags (canClaim, presence, SLA, timing);
+    // strip everything that identifies or describes the patient.
+    const out: any = { ...entry };
+    for (const key of REDACTED_QUEUE_FIELDS) delete out[key];
+    out.patientName = 'Patient in consultation';
+    out.symptoms = [];
+    out.redacted = true;
+    return out;
+}
+
+export type QueueActionBlockedReason = 'held_by_another_doctor' | 'out_of_scope' | 'role_not_permitted' | null;
+
+export interface QueueRowActions {
+    canRelease: boolean;
+    canComplete: boolean;
+    canRequeue: boolean;
+    canNoShow: boolean;
+    /** Why the row's actions are unavailable to THIS caller (null when at least one is available or the row is closed). */
+    actionBlockedReason: QueueActionBlockedReason;
+}
+
+/**
+ * Per-row action permissions for THIS caller, from the SAME predicates the
+ * mutation routes enforce (canActOnQueueEntry, isAssignedDoctor,
+ * canDoctorServeEntry via canMutateQueueEntry, and the held-by-another-doctor
+ * rule) so a button is shown only when the click can succeed.
+ */
+async function computeQueueRowActions(
+    user: AuthRequest['user'],
+    entry: any,
+    ctx: { doctorScope: DoctorScope | null; facilityUsesPlatform: (facilityId: string) => Promise<boolean> },
+): Promise<QueueRowActions> {
+    const none: QueueRowActions = { canRelease: false, canComplete: false, canRequeue: false, canNoShow: false, actionBlockedReason: null };
+    if (!user) return none;
+    const status = String(entry?.status || '');
+    const mutationRole = (QUEUE_MUTATION_ROLES as string[]).includes(user.role);
+    const completeRole = (DOCTOR_ROLES as string[]).includes(user.role);
+    const held = heldByAnotherDoctor(user, entry);
+    const tenancy = canActOnQueueEntry(user, entry) || isAssignedDoctor(user, entry);
+    const mutate = tenancy
+        || (user.role === 'doctor' && !!ctx.doctorScope && await canDoctorServeEntryWith(ctx.doctorScope, entry, ctx.facilityUsesPlatform));
+
+    const live = ['assigned', 'in_consultation'].includes(status);
+    const canRelease = mutationRole && live && tenancy && !held;
+    const canComplete = completeRole && live && tenancy && !held;
+    const canNoShow = mutationRole && ['waiting', 'assigned', 'intake_pending'].includes(status) && mutate && !held;
+    const canRequeue = mutationRole && ['no_show', 'cancelled', 'completed'].includes(status) && mutate;
+
+    let actionBlockedReason: QueueActionBlockedReason = null;
+    const active = ['waiting', 'assigned', 'in_consultation', 'intake_pending', 'diagnostics'].includes(status);
+    if (active && !(canRelease || canComplete || canNoShow)) {
+        actionBlockedReason = held ? 'held_by_another_doctor' : !mutationRole && !completeRole ? 'role_not_permitted' : 'out_of_scope';
+    }
+    return { canRelease, canComplete, canRequeue, canNoShow, actionBlockedReason };
+}
+
+function queueHeldSince(entry: any): string | null {
+    const ms = toMillis(entry?.claimedAt) || toMillis(entry?.assignedAt) || toMillis(entry?.startedAt) || 0;
+    return ms > 0 ? new Date(ms).toISOString() : null;
+}
+
+/**
+ * Add the holder's name, "held since", whether it is the caller's own patient
+ * and the per-row action permissions to queue rows. Names are resolved once
+ * per distinct holder (name only, no other profile data).
+ */
+async function decorateQueueRows(
+    rows: any[],
+    user: AuthRequest['user'],
+    doctorScope: DoctorScope | null,
+): Promise<any[]> {
+    if (!rows.length) return rows;
+    let scope = doctorScope;
+    if (!scope && user?.role === 'doctor') {
+        scope = await resolveDoctorScope(user).catch(() => null);
+    }
+    const usesPlatformCache = new Map<string, Promise<boolean>>();
+    const facilityUsesPlatform = (fid: string) => {
+        if (!usesPlatformCache.has(fid)) usesPlatformCache.set(fid, facilityUsesPlatformDoctorsAt(fid).catch(() => false));
+        return usesPlatformCache.get(fid)!;
+    };
+    const holderIds = rows
+        .filter((r) => ['assigned', 'in_consultation'].includes(String(r.status)) && r.assignedDoctorId)
+        .map((r) => r.assignedDoctorId as string);
+    const names = await resolveStaffDisplayNames(holderIds);
+    return Promise.all(rows.map(async (r) => {
+        const held = ['assigned', 'in_consultation'].includes(String(r.status)) && !!r.assignedDoctorId;
+        const actions = await computeQueueRowActions(user, r, { doctorScope: scope, facilityUsesPlatform });
+        // A doctor never receives a colleague's patient identity: the row is
+        // redacted to its board state before the holder/timing fields are added.
+        const base = heldByAnotherDoctor(user, r) ? redactForOtherDoctor(r) : r;
+        return {
+            ...base,
+            assignedDoctorName: held ? (names.get(r.assignedDoctorId)?.name || null) : null,
+            assignedToMe: !!user && !!r.assignedDoctorId && r.assignedDoctorId === user.userId,
+            heldSince: held ? queueHeldSince(r) : null,
+            ...actions,
+        };
+    }));
+}
+
+/** One counting rule for the summary, so counts always equal the rows returned. */
+function countQueueRows(rows: any[]) {
     return {
-        queueId: entry.queueId,
-        status: entry.status,
-        facilityId: entry.facilityId ?? null,
-        urgencyLevel: entry.urgencyLevel,
-        triageCategory: entry.triageCategory,
-        joinedAt: entry.joinedAt,
-        assignedAt: entry.assignedAt,
-        assignedDoctorId: entry.assignedDoctorId,
-        patientName: 'Patient in consultation',
-        symptoms: [],
-        redacted: true,
+        total: rows.length,
+        waiting: rows.filter((e) => e.status === 'waiting').length,
+        assigned: rows.filter((e) => e.status === 'assigned').length,
+        inConsultation: rows.filter((e) => e.status === 'in_consultation').length,
     };
 }
 
@@ -733,26 +968,21 @@ router.get('/queue', authorize(...QUEUE_READ_ROLES), requireCompletedCredential(
 
     // Heartbeat: when a doctor polls the telehealth queue and is accepting consultations,
     // refresh their doctorPresence so they do not go stale after 5 minutes.
-    let isHybridDoctor = false;
-    let hybridAllowedFacilities = new Set<string>();
+    // Doctors are scoped with the ONE claim predicate (visibility == claimability):
+    // their own facilities, central entries when platform-eligible, and opted-in
+    // facilities' entries — instead of the token facility alone.
+    let doctorScope: DoctorScope | null = null;
     if (req.user?.role === 'doctor') {
         try {
             const docSnap = await collections.doctors.doc(req.user.userId).get();
             const docData = docSnap.exists ? docSnap.data() : null;
-            if (docData) {
-                if (docData.doctorType === 'both' || docData.platformTelehealthAgreement === true) {
-                    isHybridDoctor = true;
-                    [req.user.facilityId, docData.facilityId, ...(Array.isArray(docData.allowedFacilityIds) ? docData.allowedFacilityIds : [])]
-                        .filter(Boolean)
-                        .forEach((f: string) => hybridAllowedFacilities.add(f));
-                }
-                if (docData.availability?.isAcceptingConsultations !== false) {
-                    await doctorPresenceService.setOnline?.(
-                        req.user.userId,
-                        docData.facilityId ?? req.user.facilityId,
-                    );
-                    await doctorPresenceService.setAvailable?.(req.user.userId, true);
-                }
+            doctorScope = await resolveDoctorScope(req.user, docData);
+            if (docData && docData.availability?.isAcceptingConsultations !== false) {
+                await doctorPresenceService.setOnline?.(
+                    req.user.userId,
+                    docData.facilityId ?? req.user.facilityId,
+                );
+                await doctorPresenceService.setAvailable?.(req.user.userId, true);
             }
         } catch { /* best-effort presence heartbeat */ }
     }
@@ -765,29 +995,41 @@ router.get('/queue', authorize(...QUEUE_READ_ROLES), requireCompletedCredential(
         query = query.where('status', 'in', ['waiting', 'assigned', 'in_consultation', 'diagnostics']);
     }
 
-    // A hybrid doctor ('both' / platformTelehealthAgreement) polling without an explicit facility filter
-    // sees the central platform queue AND each allowed facility. Each scope is its own query: a single
-    // unscoped `limit(100)` filtered in memory let other facilities' entries crowd theirs out.
-    const scopes: QueueReadScope[] = isHybridDoctor && !req.query.facilityId
-        ? [CENTRAL_QUEUE, 'DOCARION_PLATFORM', ...Array.from(hybridAllowedFacilities)]
-        : [facilityId];
-    const snapshots = await Promise.all(
-        scopes.map((scope) => applyQueueScope(query, scope).orderBy('joinedAt', 'asc').limit(100).get()),
-    );
-    const seen = new Set<string>();
+    // A doctor polling without an explicit facility filter is scoped in memory
+    // by the claim predicate below (own facilities + central when eligible).
+    const snapshot = (!doctorScope || req.query.facilityId)
+        ? await getScopedQueueDocs(query, facilityId, (q) => q.orderBy('joinedAt', 'asc').limit(100), {
+            compare: compareDocsByField('joinedAt', 'asc'),
+            limit: 100,
+        })
+        : await query.orderBy('joinedAt', 'asc').limit(100).get();
     const nowMs = Date.now();
-    let entries = snapshots
-        .flatMap((snapshot: any) => snapshot.docs)
-        .filter((doc: any) => (seen.has(doc.id) ? false : (seen.add(doc.id), true)))
-        .map((doc: any) => {
-            const raw = doc.data();
-            if (isAnotherDoctorsPatient(req.user, raw)) return redactForOtherDoctor(raw);
-            const presence = computePatientOnlinePresence(raw, nowMs);
-            return {
-                ...raw,
-                ...presence,
-            };
-        });
+    const facilityUsesPlatformCache = new Map<string, Promise<boolean>>();
+    const facilityUsesPlatform = (fid: string) => {
+        if (!facilityUsesPlatformCache.has(fid)) {
+            facilityUsesPlatformCache.set(fid, facilityUsesPlatformDoctorsAt(fid).catch(() => false));
+        }
+        return facilityUsesPlatformCache.get(fid)!;
+    };
+    const mapped = snapshot.docs.map((doc: any) => {
+        const raw = doc.data();
+        const presence = computePatientOnlinePresence(raw, nowMs, { heartbeatOnlyWhenLive: true });
+        return { ...raw, ...presence };
+    });
+    const visible = await Promise.all(mapped.map(async (e: any) => {
+        if (!doctorScope || req.query.facilityId) return true;
+        if (e.assignedDoctorId && e.assignedDoctorId === req.user!.userId) return true;
+        const fid = partnerSiteIdOf(e.facilityId);
+        return canDoctorServeConsultation(doctorScope, {
+            facilityId: fid,
+            doctorId: e.assignedDoctorId || null,
+            status: e.status || null,
+            routedVia: e.routedVia || null,
+            routedToPlatform: e.routedToPlatform === true,
+            facilityUsesPlatformDoctors: fid ? await facilityUsesPlatform(fid) : false,
+        }).ok;
+    }));
+    let entries = mapped.filter((_: any, i: number) => visible[i]).map((e: any) => withClaimState(e, req.user?.userId));
 
     if (presenceFilter === 'online') {
         entries = entries.filter((e: any) => e.patientOnline === true);
@@ -809,6 +1051,11 @@ router.get('/queue', authorize(...QUEUE_READ_ROLES), requireCompletedCredential(
         await doctorPresenceService.getAvailableDoctors(typeof facilityId === 'string' ? facilityId : undefined)
     );
 
+    // Holder name, "held since", assignedToMe and per-row action permissions
+    // (same predicates as the mutation routes) — then the counts are taken from
+    // the SAME rows, so the summary can never disagree with the table.
+    entries = await decorateQueueRows(entries, req.user, doctorScope);
+    const counts = countQueueRows(entries);
     const waitingEntries = entries.filter((e: any) => e.status === 'waiting');
 
     res.json({
@@ -816,12 +1063,13 @@ router.get('/queue', authorize(...QUEUE_READ_ROLES), requireCompletedCredential(
         data: {
             queue: entries,
             stats: {
-                total: entries.length,
-                waiting: waitingEntries.length,
+                total: counts.total,
+                waiting: counts.waiting,
                 onlineWaiting: waitingEntries.filter((e: any) => e.patientOnline).length,
                 offlineWaiting: waitingEntries.filter((e: any) => !e.patientOnline).length,
-                assigned: entries.filter((e: any) => e.status === 'assigned').length,
-                inConsultation: entries.filter((e: any) => e.status === 'in_consultation').length,
+                assigned: counts.assigned,
+                inConsultation: counts.inConsultation,
+                mine: entries.filter((e: any) => e.assignedToMe).length,
                 availableDoctors: availableDoctors.length,
             }
         }
@@ -896,19 +1144,22 @@ router.post('/assign', authorize(...QUEUE_CLAIM_ROLES), requireCompletedCredenti
     if (!preRead.exists) return res.status(404).json({ success: false, error: 'Queue entry not found' });
     const preEntry: any = preRead.data();
     if (!canActOnQueueEntry(req.user, preEntry)) {
-        // Check if caller is a hybrid doctor ('both' / platformTelehealthAgreement) taking a platform or allowed-facility patient
-        let hybridAllowed = false;
+        // A doctor taking the patient THEMSELVES is judged by the same scope
+        // predicate as POST /consultations/:id/claim (visibility == claimability).
+        let selfAllowed = false;
         if (req.user?.role === 'doctor' && String(doctorId) === req.user.userId) {
-            const callerDoc = await collections.doctors.doc(req.user.userId).get();
-            const callerData: any = callerDoc.exists ? callerDoc.data() : null;
-            if (callerData && (callerData.doctorType === 'both' || callerData.platformTelehealthAgreement === true)) {
-                const allowedFacs = [req.user.facilityId, callerData.facilityId, ...(callerData.allowedFacilityIds || [])].filter(Boolean);
-                if (!preEntry.facilityId || preEntry.facilityId === 'DOCARION_PLATFORM' || allowedFacs.includes(preEntry.facilityId)) {
-                    hybridAllowed = true;
-                }
-            }
+            const scope = await resolveDoctorScope(req.user);
+            const fid = partnerSiteIdOf(preEntry.facilityId);
+            selfAllowed = canDoctorServeConsultation(scope, {
+                facilityId: fid,
+                doctorId: preEntry.assignedDoctorId || null,
+                status: preEntry.status || null,
+                routedVia: preEntry.routedVia || null,
+                routedToPlatform: preEntry.routedToPlatform === true,
+                facilityUsesPlatformDoctors: fid ? await facilityUsesPlatformDoctorsAt(fid).catch(() => false) : false,
+            }).ok;
         }
-        if (!hybridAllowed) return denyQueueScope(res);
+        if (!selfAllowed) return denyQueueScope(res);
     }
 
     // LICENSURE WALL: the ACTOR is gated by requireCompletedCredential above;
@@ -928,11 +1179,19 @@ router.post('/assign', authorize(...QUEUE_CLAIM_ROLES), requireCompletedCredenti
     // (3) TARGET ↔ FACILITY — same rule the claim gate applies
     // (consultation.routes.ts): a FACILITY doctor may only serve their own
     // facility (or an explicitly allowed one). Platform doctors serve anywhere.
-    if (preEntry.facilityId) {
+    if (partnerSiteIdOf(preEntry.facilityId)) {
         const targetDoc = await collections.doctors.doc(String(doctorId)).get();
         const target: any = targetDoc.exists ? targetDoc.data() : null;
-        if (target && (target.doctorType || 'platform') === 'facility') {
-            const allowed = [target.facilityId, ...(target.allowedFacilityIds || [])].filter(Boolean);
+        // Same derivation as the claim gate (a facility doctor = any known facility,
+        // not only an explicit doctorType). Platform doctors may be assigned by an admin.
+        const targetScope = await resolveDoctorScopeFor({
+            userId: String(doctorId),
+            role: 'doctor',
+            facilityId: null,
+            doctorDoc: target,
+        });
+        if (targetScope.kind === 'facility') {
+            const allowed = Array.from(targetScope.facilityIds);
             if (!allowed.includes(preEntry.facilityId)) {
                 return res.status(403).json({
                     success: false,
@@ -974,9 +1233,12 @@ router.post('/assign', authorize(...QUEUE_CLAIM_ROLES), requireCompletedCredenti
     // has one from intake (FLOW-GAP-3); only mint a new record otherwise.
     let consultationNumber: any = existingConsult?.consultationNumber;
     if (existingConsult) {
+        // Same outcome as POST /consultations/:id/claim: the patient's consult
+        // moves to `accepted` (doctor claimed), never back to `scheduled`.
         await collections.consultations.doc(consultationId).set({
             doctorId,
-            status: 'scheduled',
+            status: 'accepted',
+            claimedAt: existingConsult.claimedAt || new Date(),
             queueId,
             ...(existingConsult.facilityId ? {} : { facilityId: entry.facilityId }),
             assignedAt: new Date(),
@@ -993,7 +1255,7 @@ router.post('/assign', authorize(...QUEUE_CLAIM_ROLES), requireCompletedCredenti
             patientId: entry.patientId,
             is_sandbox: req.isSandbox || false,
             doctorId,
-            facilityId: entry.facilityId,
+            facilityId: centralRecordFacilityId(entry.facilityId),
             type: 'chat',
             status: 'scheduled',
             symptoms: entry.symptoms,
@@ -1125,10 +1387,15 @@ export async function autoAssignNextPatient(
     const { facilityId, isSandbox } = opts;
 
     // Get next waiting patient (priority-ordered)
-    let queueQuery: any = collections.telehealthQueue.where('status', '==', 'waiting');
-    if (facilityId) queueQuery = queueQuery.where('facilityId', '==', facilityId);
-
-    const queueSnapshot = await queueQuery.orderBy('joinedAt', 'asc').limit(10).get();
+    const centralOnly = isCentralScopeValue(facilityId);
+    const waitingBase: any = collections.telehealthQueue.where('status', '==', 'waiting');
+    const queueSnapshot = centralOnly
+        ? await getCentralDocs((v) => waitingBase.where('facilityId', '==', v).orderBy('joinedAt', 'asc').limit(10), {
+            compare: compareDocsByField('joinedAt', 'asc'),
+            limit: 10,
+        })
+        : await (facilityId ? waitingBase.where('facilityId', '==', facilityId) : waitingBase)
+            .orderBy('joinedAt', 'asc').limit(10).get();
     if (queueSnapshot.empty) return { status: 'no_waiting' };
 
     // Sort by urgency priority (emergency first)
@@ -1139,22 +1406,63 @@ export async function autoAssignNextPatient(
         const pb = urgencyOrder[b.urgencyLevel as keyof typeof urgencyOrder] ?? 3;
         return pa - pb;
     });
-    const nextPatient = entries[0];
-
-    // Get available doctor (round-robin by active consultations),
+    // Get available doctors (round-robin by active consultations),
     // then drop any who have turned off accepting consultations.
-    const presentDoctors = await doctorPresenceService.getAvailableDoctors(facilityId);
+    // Central has no doctor-presence bucket of its own: take everyone present and
+    // let the claim predicate below pair only doctors who can serve the patient.
+    const presentDoctors = await doctorPresenceService.getAvailableDoctors(centralOnly ? undefined : facilityId);
     const doctors = await filterDoctorsAcceptingConsultations(presentDoctors);
     if (doctors.length === 0) return { status: 'no_doctors' };
 
-    // Optionally match by language
-    const selectedDoctor = doctors[0]; // Default: least loaded
+    // SCOPE (audit 2026-10-29 Q4): the runner used to hand the oldest row to
+    // doctorPresence[0] regardless of facility, so a facility doctor "stole"
+    // central patients and every other doctor's claim got 409. Pair the first
+    // (patient, doctor) where the doctor could have claimed that patient.
+    const scopeCache = new Map<string, Promise<DoctorScope>>();
+    const scopeOf = (d: any) => {
+        const uid = String(d.userId);
+        if (!scopeCache.has(uid)) {
+            scopeCache.set(uid, resolveDoctorScopeFor({ userId: uid, role: 'doctor', facilityId: d.facilityId ?? null }));
+        }
+        return scopeCache.get(uid)!;
+    };
+    let nextPatient: any = null;
+    let selectedDoctor: any = null;
+    for (const candidate of entries) {
+        const fid = partnerSiteIdOf(candidate.facilityId);
+        const usesPlatform = fid ? await facilityUsesPlatformDoctorsAt(fid).catch(() => false) : false;
+        for (const d of doctors) {
+            const ok = canDoctorServeConsultation(await scopeOf(d), {
+                facilityId: fid,
+                doctorId: null,
+                status: 'waiting',
+                routedVia: candidate.routedVia || null,
+                routedToPlatform: candidate.routedToPlatform === true,
+                facilityUsesPlatformDoctors: usesPlatform,
+            }).ok;
+            if (ok) { nextPatient = candidate; selectedDoctor = { ...d, userId: String(d.userId) }; break; }
+        }
+        if (nextPatient) break;
+    }
+    if (!nextPatient || !selectedDoctor) return { status: 'no_doctors' };
 
     const consultationId = nextPatient.consultationId || uuidv4();
     const conversationId = uuidv4();
     const allParticipants = [nextPatient.patientId, selectedDoctor.userId];
 
     const queueRef = collections.telehealthQueue.doc(nextPatient.queueId);
+
+    // Never overwrite a doctor who already holds this consultation (a booked
+    // doctor served by the bridge, or a claim that raced this runner): mark the
+    // row assigned to THEM and move on.
+    if (nextPatient.consultationId) {
+        const held = (await collections.consultations.doc(nextPatient.consultationId).get()).data();
+        if (held?.doctorId && held.doctorId !== selectedDoctor.userId
+            && ['accepted', 'confirmed', 'in_progress', 'scheduled'].includes(String(held.status))) {
+            await queueRef.set({ status: 'assigned', assignedDoctorId: held.doctorId, assignedAt: new Date() }, { merge: true }).catch(() => { });
+            return { status: 'conflict' };
+        }
+    }
 
     try {
         await firestore.runTransaction(async (tx: any) => {
@@ -1181,9 +1489,11 @@ export async function autoAssignNextPatient(
     });
 
     if (nextPatient.consultationId) {
+        // Same outcome as a claim: the patient's own consult moves to `accepted`.
         await collections.consultations.doc(consultationId).set({
             doctorId: selectedDoctor.userId,
-            status: 'scheduled',
+            status: 'accepted',
+            claimedAt: new Date(),
             queueId: nextPatient.queueId,
             assignedAt: new Date(),
             updatedAt: new Date(),
@@ -1195,7 +1505,7 @@ export async function autoAssignNextPatient(
             patientId: nextPatient.patientId,
             is_sandbox: isSandbox || false,
             doctorId: selectedDoctor.userId,
-            facilityId: nextPatient.facilityId,
+            facilityId: centralRecordFacilityId(nextPatient.facilityId),
             type: 'chat',
             status: 'scheduled',
             symptoms: nextPatient.symptoms,
@@ -1312,8 +1622,8 @@ router.post('/complete', authorize(...DOCTOR_ROLES), asyncHandler(async (req: Au
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Queue entry not found' });
 
     const entry = doc.data()!;
-    if (isAnotherDoctorsPatient(req.user, entry)) return denyAnotherDoctorsPatient(res);
     if (!canActOnQueueEntry(req.user, entry) && !isAssignedDoctor(req.user, entry)) return denyQueueScope(res);
+    if (heldByAnotherDoctor(req.user, entry)) return denyHeldByAnotherDoctor(res);
     if (!['assigned', 'in_consultation'].includes(entry.status)) {
         return res.status(400).json({ success: false, error: `Cannot complete — status is ${entry.status}` });
     }
@@ -1342,6 +1652,10 @@ router.post('/complete', authorize(...DOCTOR_ROLES), asyncHandler(async (req: Au
             updatedAt: new Date(),
         }).catch(() => {});
         await transitionEncounterFromConsultation(entry.consultationId, 'completed', new Date()).catch(() => {});
+        // A facility/practice that charges at completion collects now; a paid
+        // consult settles to the facility. No-ops for Docarion's free consults.
+        await collectConsultFeeAtCompletion(entry.consultationId).catch(() => null);
+        await settleConsultOnComplete(entry.consultationId).catch(() => null);
     }
 
     // Decrement doctor's active consultations
@@ -1392,50 +1706,73 @@ router.patch('/bulk-update', authorize(...QUEUE_MUTATION_ROLES), asyncHandler(as
     if (!queueIds?.length || !status) {
         return res.status(400).json({ success: false, error: 'queueIds and status are required' });
     }
-    if (!['cancelled', 'no_show', 'completed'].includes(status)) {
+    // The web board sent "removed" for years; it is a cancellation.
+    const target: string = status === 'removed' ? 'cancelled' : status;
+    if (!['cancelled', 'no_show', 'completed'].includes(target)) {
         return res.status(400).json({ success: false, error: 'Invalid status. Must be: cancelled, no_show, or completed' });
     }
+    const reasonText = typeof reason === 'string' ? reason.trim() : '';
+    if (target !== 'completed' && reasonText.length < 3) {
+        return res.status(400).json({ success: false, error: 'A reason is required when cancelling or marking no-show', code: 'REASON_REQUIRED' });
+    }
 
-    const batch = firestore.batch();
     let updated = 0;
     let skippedOutOfScope = 0;
-    let skippedAssignedElsewhere = 0;
+    let skippedHeld = 0;
+    let refunded = 0;
 
     for (const queueId of queueIds.slice(0, 50)) { // Max 50 per batch
         const ref = collections.telehealthQueue.doc(queueId);
         const doc = await ref.get();
-        if (doc.exists && !canActOnQueueEntry(req.user, doc.data())) {
+        if (!doc.exists) continue;
+        const data = doc.data()!;
+        if (!(await canMutateQueueEntry(req.user, data))) {
             skippedOutOfScope++;
             continue;
         }
-        if (doc.exists && isAnotherDoctorsPatient(req.user, doc.data())) {
-            skippedAssignedElsewhere++;
+        if (heldByAnotherDoctor(req.user, data)) {
+            // Out of this doctor's scope too: counted in both so older clients
+            // that only read `skippedOutOfScope` still see the skip.
+            skippedHeld++;
+            skippedOutOfScope++;
             continue;
         }
-        if (doc.exists && ['waiting', 'assigned'].includes(doc.data()!.status)) {
-            batch.update(ref, {
-                status,
+        if (!['waiting', 'assigned', 'intake_pending'].includes(data.status)) continue;
+        if (target === 'completed') {
+            await ref.update({
+                status: 'completed',
                 completedAt: new Date(),
-                statusReason: reason || `Bulk ${status} by staff`,
+                statusReason: reasonText || 'Bulk completed by staff',
                 updatedBy: req.user!.userId,
                 updatedByRole: req.user!.role,
                 updatedAt: new Date(),
             });
             updated++;
+            continue;
         }
+        // Each patient is told, each paid consult refunded, each no-show counted.
+        const outcome = await applyQueueDisposition({
+            entry: { ...data, queueId },
+            status: target as 'cancelled' | 'no_show',
+            reasonCode: target === 'no_show' ? 'no_show' : 'cleared',
+            reason: reasonText,
+            actor: { userId: req.user!.userId, role: req.user!.role },
+            reliability: target === 'no_show' ? 'no_show' : null,
+        });
+        if (outcome.queueUpdated) updated++;
+        if (outcome.refund?.refunded) refunded++;
     }
 
-    await batch.commit();
-
     await logAudit(req, 'QUEUE_BULK_UPDATE', 'telehealthQueue', queueIds.join(','), {
-        details: { status, count: updated, reason, skippedOutOfScope, skippedAssignedElsewhere },
+        details: { status: target, count: updated, reason: reasonText, skippedOutOfScope, skippedHeld, refunded },
         ...(skippedOutOfScope ? { severity: 'warning' as const } : {}),
     });
 
+    void notifyQueueAdvancement();
     res.json({
         success: true,
-        message: `${updated} queue entries updated to ${status}`,
-        data: { updated, skippedOutOfScope, skippedAssignedElsewhere },
+        message: `${updated} queue entries updated to ${target}`,
+        data: { updated, skippedOutOfScope, skippedHeld, refunded },
     });
 }));
 
@@ -1482,35 +1819,42 @@ router.delete('/clear', authorize('clinic_admin', 'hospital_admin', 'admin', 'su
         });
     }
 
-    let query: any = collections.telehealthQueue.where('status', 'in', ['waiting', 'assigned']);
-    if (facilityId) query = query.where('facilityId', '==', facilityId);
-
-    const snapshot = await query.get();
+    const clearBase: any = collections.telehealthQueue.where('status', 'in', ['waiting', 'assigned']);
+    // Central's rows carry two encodings (null / 'docarion-central'): read both.
+    const snapshot = facilityId && isCentralScopeValue(facilityId)
+        ? await getCentralDocs((v) => clearBase.where('facilityId', '==', v))
+        : await (facilityId ? clearBase.where('facilityId', '==', facilityId) : clearBase).get();
 
     if (snapshot.empty) {
         return res.json({ success: true, message: 'Queue is already empty', data: { cleared: 0 } });
     }
 
-    const batch = firestore.batch();
-    snapshot.docs.forEach((doc: any) => {
-        batch.update(doc.ref, {
-            status: 'cancelled',
-            completedAt: new Date(),
-            statusReason: 'Queue cleared by admin',
-            updatedBy: req.user!.userId,
-            updatedByRole: req.user!.role,
-            updatedAt: new Date(),
-        });
-    });
+    const rawReason = req.query.reason ?? (req.body || {}).reason;
+    const reasonText = typeof rawReason === 'string' && rawReason.trim() ? rawReason.trim().slice(0, 300) : 'Queue cleared by admin';
 
-    await batch.commit();
+    // Every patient is told, every paid consult refunded, every consultation
+    // mirrored — a cleared queue must not leave records "waiting" elsewhere.
+    let cleared = 0;
+    let refunded = 0;
+    for (const doc of snapshot.docs.slice(0, 200)) {
+        const outcome = await applyQueueDisposition({
+            entry: { ...doc.data(), queueId: doc.data().queueId || doc.id },
+            status: 'cancelled',
+            reasonCode: 'cleared',
+            reason: reasonText,
+            actor: { userId: req.user!.userId, role: req.user!.role },
+            reliability: null,
+        });
+        if (outcome.queueUpdated) cleared++;
+        if (outcome.refund?.refunded) refunded++;
+    }
 
     await logAudit(req, 'QUEUE_CLEARED', 'telehealthQueue', facilityId || 'platform', {
-        details: { cleared: snapshot.size, facilityId, scope: facilityId ? 'facility' : 'platform' },
+        details: { cleared, refunded, reason: reasonText, facilityId, scope: facilityId ? 'facility' : 'platform' },
         severity: facilityId ? 'warning' : 'critical',
     });
 
-    res.json({ success: true, message: `Queue cleared: ${snapshot.size} entries`, data: { cleared: snapshot.size } });
+    res.json({ success: true, message: `Queue cleared: ${cleared} entries`, data: { cleared, refunded } });
 }));
 
 /**
@@ -1524,10 +1868,14 @@ router.patch('/:queueId/no-show', authorize(...QUEUE_MUTATION_ROLES), asyncHandl
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Queue entry not found' });
 
     const data = doc.data()!;
-    if (isAnotherDoctorsPatient(req.user, data)) return denyAnotherDoctorsPatient(res);
-    if (!canActOnQueueEntry(req.user, data)) return denyQueueScope(res); // WALL-GAP-4
-    if (!['waiting', 'assigned'].includes(data.status)) {
+    if (!(await canMutateQueueEntry(req.user, data))) return denyQueueScope(res); // WALL-GAP-4 + claim-scope
+    if (heldByAnotherDoctor(req.user, data)) return denyHeldByAnotherDoctor(res);
+    if (!['waiting', 'assigned', 'intake_pending'].includes(data.status)) {
         return res.status(400).json({ success: false, error: 'Entry is not in an active state' });
+    }
+    const reasonText = typeof reason === 'string' ? reason.trim() : '';
+    if (reasonText.length < 3) {
+        return res.status(400).json({ success: false, error: 'A reason is required (for example: called twice, no answer)', code: 'REASON_REQUIRED' });
     }
 
     // Release the doctor if assigned
@@ -1535,28 +1883,24 @@ router.patch('/:queueId/no-show', authorize(...QUEUE_MUTATION_ROLES), asyncHandl
         await doctorPresenceService.updateActiveConsultations(data.assignedDoctorId, -1);
     }
 
-    await doc.ref.update({
+    // Closes the row, mirrors the consultation (never one in progress),
+    // refunds a paid consult, tells the patient how to rejoin, records a
+    // reliability event (phase 1: counters only, no fee).
+    const outcome = await applyQueueDisposition({
+        entry: { ...data, queueId },
         status: 'no_show',
-        completedAt: new Date(),
-        statusReason: reason || 'Patient did not respond when called',
-        noShowAt: new Date(),
-        updatedBy: req.user!.userId,
-        updatedByRole: req.user!.role,
-        updatedAt: new Date(),
+        reasonCode: 'no_show',
+        reason: reasonText,
+        actor: { userId: req.user!.userId, role: req.user!.role },
+        reliability: 'no_show',
     });
-
-    if (data.consultationId) {
-        await collections.consultations.doc(data.consultationId).update({
-            status: 'no_show',
-            updatedAt: new Date(),
-        }).catch(() => {});
-    }
 
     await logAudit(req, 'QUEUE_NO_SHOW', 'telehealthQueue', queueId, {
-        details: { patientId: data.patientId, reason },
+        details: { patientId: data.patientId, reason: reasonText, consultationId: data.consultationId || null, refunded: outcome.refund?.refunded === true },
     });
 
-    res.json({ success: true, message: 'Patient marked as no-show' });
+    void notifyQueueAdvancement();
+    res.json({ success: true, message: 'Patient marked as no-show; they have been told how to rejoin', data: { refund: outcome.refund } });
 }));
 
 /**
@@ -1620,8 +1964,8 @@ router.post('/:queueId/release', authorize(...QUEUE_MUTATION_ROLES), asyncHandle
     }
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Queue entry not found' });
     const data = doc.data()!;
-    if (isAnotherDoctorsPatient(req.user, data)) return denyAnotherDoctorsPatient(res);
     if (!canActOnQueueEntry(req.user, data) && !isAssignedDoctor(req.user, data)) return denyQueueScope(res); // WALL-GAP-4
+    if (heldByAnotherDoctor(req.user, data)) return denyHeldByAnotherDoctor(res);
     if (!['assigned', 'in_consultation'].includes(data.status)) {
         return res.status(409).json({ success: false, error: `Can only return assigned patients (current: ${data.status})` });
     }
@@ -1670,7 +2014,7 @@ router.post('/:queueId/requeue', authorize(...QUEUE_MUTATION_ROLES), asyncHandle
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Queue entry not found' });
 
     const data = doc.data()!;
-    if (!canActOnQueueEntry(req.user, data)) return denyQueueScope(res); // WALL-GAP-4
+    if (!(await canMutateQueueEntry(req.user, data))) return denyQueueScope(res); // WALL-GAP-4 + claim-scope
     if (!['no_show', 'cancelled', 'completed'].includes(data.status)) {
         return res.status(400).json({ success: false, error: 'Can only re-queue no-show, cancelled, or completed entries' });
     }
@@ -1703,7 +2047,9 @@ router.post('/:queueId/requeue', authorize(...QUEUE_MUTATION_ROLES), asyncHandle
         status: 'waiting',
         position: newPosition,
         assignedDoctorId: null,
-        consultationId: null,
+        // Keep the visit's consultation (audit 2026-10-29 O1: a requeue used to
+        // orphan it, leaving the record no_show while the patient waited again).
+        consultationId: data.status === 'completed' ? null : (data.consultationId || null),
         joinedAt: new Date(),
         assignedAt: null,
         completedAt: null,
@@ -1718,6 +2064,23 @@ router.post('/:queueId/requeue', authorize(...QUEUE_MUTATION_ROLES), asyncHandle
         requeuedTo: newQueueId,
         updatedAt: new Date(),
     });
+
+    // Re-open the consultation so the next doctor can claim it.
+    if (data.status !== 'completed' && data.consultationId) {
+        await collections.consultations.doc(data.consultationId).set({
+            status: 'intake_complete',
+            doctorId: null,
+            queueId: newQueueId,
+            requeuedAt: new Date(),
+            requeuedBy: req.user!.userId,
+            updatedAt: new Date(),
+        }, { merge: true }).catch(() => {});
+    }
+    if (data.patientId) {
+        notificationService.sendToUser(data.patientId, 'Back in the queue',
+            priority === 'front' ? 'The care team has put you back at the front of the queue.' : 'The care team has put you back in the queue.',
+            { type: 'queue_returned', queueId: newQueueId, url: '/queue' }).catch(() => {});
+    }
 
     await logAudit(req, 'QUEUE_REQUEUED', 'telehealthQueue', newQueueId, {
         details: { originalQueueId: queueId, patientId: data.patientId, position: newPosition },
@@ -1742,21 +2105,16 @@ router.get('/analytics', authorize(...STAFF_ROLES), asyncHandler(async (req: Aut
     let baseQuery: any = collections.telehealthQueue;
     
     // Current queue
-    let waitingQuery = applyQueueScope(baseQuery.where('status', '==', 'waiting'), facilityId);
-    let assignedQuery = applyQueueScope(baseQuery.where('status', 'in', ['assigned']), facilityId);
-
     const [waitingSnap, assignedSnap] = await Promise.all([
-        waitingQuery.get(),
-        assignedQuery.get(),
+        getScopedQueueDocs(baseQuery.where('status', '==', 'waiting'), facilityId),
+        getScopedQueueDocs(baseQuery.where('status', 'in', ['assigned']), facilityId),
     ]);
 
     // Today's stats
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
 
-    let todayQuery = baseQuery.where('joinedAt', '>=', todayStart);
-    todayQuery = applyQueueScope(todayQuery, facilityId);
-    const todaySnap = await todayQuery.get();
+    const todaySnap = await getScopedQueueDocs(baseQuery.where('joinedAt', '>=', todayStart), facilityId);
 
     const todayStats = {
         total: todaySnap.size,
@@ -1828,7 +2186,7 @@ function resolveDoctorShiftNow(
     const doctorShifts = todayShifts.filter((sh) => {
         if (sh.staffUserId !== userId) return false;
         if (sh.status === 'cancelled') return false;
-        if (targetFacilityId && targetFacilityId !== 'central' && sh.facilityId && sh.facilityId !== targetFacilityId) {
+        if (targetFacilityId && !isCentralScopeValue(targetFacilityId) && sh.facilityId && sh.facilityId !== targetFacilityId) {
             return false;
         }
         return true;
@@ -1869,7 +2227,7 @@ function buildCoverageSummary(doctorsList: any[], waitingPatientsCount: number) 
     const inSessionDoctors = doctorsList.filter((d) => d.shiftStatus === 'online_in_session').length;
     const scheduledOnShiftNow = doctorsList.filter((d) => d.onShiftNow).length;
     const scheduledButOfflineCount = doctorsList.filter((d) => d.shiftStatus === 'offline_on_shift').length;
-    const totalOnline = onlineAvailableDoctors + inSessionDoctors;
+    const totalOnline = doctorsList.filter((d) => d.isOnline === true).length;
 
     let coverageAlert:
         | 'critical_no_doctors_with_waiting_patients'
@@ -1891,6 +2249,10 @@ function buildCoverageSummary(doctorsList: any[], waitingPatientsCount: number) 
         totalCredentialedDoctors,
         onlineAvailableDoctors,
         inSessionDoctors,
+        /** Every roster doctor flagged online (available + in a session). */
+        onlineDoctors: totalOnline,
+        /** True only when NO roster doctor is online — derived from the same array as every count above. */
+        noDoctorsOnline: totalOnline === 0,
         scheduledOnShiftNow,
         scheduledButOfflineCount,
         waitingPatientsCount,
@@ -1972,12 +2334,16 @@ router.get('/coverage-status', authorize(...COVERAGE_VIEW_ROLES), asyncHandler(a
     const scopedDoctors = credentialedDoctors.filter((d: any) => {
         const doc = d.data();
         if (!targetFacilityId) return true;
-        if (targetFacilityId === 'central') {
-            return !doc.facilityId || doc.doctorType === 'platform';
+        if (isCentralScopeValue(targetFacilityId)) {
+            return !partnerSiteIdOf(doc.facilityId) || doc.doctorType === 'platform';
         }
         const allowed = [doc.facilityId, ...(Array.isArray(doc.allowedFacilityIds) ? doc.allowedFacilityIds : [])].filter(Boolean);
         return allowed.includes(targetFacilityId);
     });
+
+    // Names live on the users document (doctors docs often carry none), so the
+    // roster resolves them here instead of printing raw ids in the web table.
+    const staffNames = await resolveStaffDisplayNames(scopedDoctors.map((d: any) => d.userId));
 
     // Map doctorPresence by userId
     const presenceMap = new Map<string, any>();
@@ -2017,7 +2383,7 @@ router.get('/coverage-status', authorize(...COVERAGE_VIEW_ROLES), asyncHandler(a
     const allWaitingEntries = waitingQueueSnap.docs.map((d: any) => d.data());
     const scopedWaitingEntries = allWaitingEntries.filter((entry: any) => {
         if (!targetFacilityId) return true;
-        if (targetFacilityId === 'central') return !entry.facilityId;
+        if (isCentralScopeValue(targetFacilityId)) return isDocarionCentralRecord(entry);
         return entry.facilityId === targetFacilityId;
     });
 
@@ -2064,17 +2430,24 @@ router.get('/coverage-status', authorize(...COVERAGE_VIEW_ROLES), asyncHandler(a
             shiftStatus = 'off_duty';
         }
 
-        const fullName = `${doc.profile?.firstName || doc.firstName || ''} ${doc.profile?.lastName || doc.lastName || ''}`.trim()
+        const resolved = staffNames.get(userId);
+        const firstName = doc.profile?.firstName || doc.firstName || resolved?.firstName || null;
+        const lastName = doc.profile?.lastName || doc.lastName || resolved?.lastName || null;
+        // Never fall back to the raw user id: an unnamed doctor reads "Doctor (name not set)".
+        const fullName = `${firstName || ''} ${lastName || ''}`.trim()
             || doc.name
+            || resolved?.name
             || doc.email
-            || userId;
+            || 'Doctor (name not set)';
 
         return {
             userId,
             name: fullName,
-            specialization: doc.specialization || 'General Practice',
+            firstName,
+            lastName,
+            specialization: doc.specialization || resolved?.specialization || 'General Practice',
             facilityId: doc.facilityId || null,
-            doctorType: doc.doctorType || (doc.facilityId ? 'facility' : 'platform'),
+            doctorType: doc.doctorType || (partnerSiteIdOf(doc.facilityId) ? 'facility' : 'platform'),
             isOnline,
             isAcceptingConsultations,
             lastSeen: lastSeenDate && !Number.isNaN(lastSeenDate.getTime()) ? lastSeenDate.toISOString() : null,
@@ -2092,8 +2465,8 @@ router.get('/coverage-status', authorize(...COVERAGE_VIEW_ROLES), asyncHandler(a
     // For platform admins querying without a specific facilityId, include Central Network breakdown
     let centralBreakdown: any = undefined;
     if (!targetFacilityId && isPlatformQueueAdmin(user)) {
-        const centralDoctors = doctors.filter((d: any) => !d.facilityId || d.doctorType === 'platform');
-        const centralWaitingCount = allWaitingEntries.filter((e: any) => !e.facilityId).length;
+        const centralDoctors = doctors.filter((d: any) => !partnerSiteIdOf(d.facilityId) || d.doctorType === 'platform');
+        const centralWaitingCount = allWaitingEntries.filter((e: any) => isDocarionCentralRecord(e)).length;
         centralBreakdown = buildCoverageSummary(centralDoctors, centralWaitingCount);
     }
 
@@ -2103,23 +2476,60 @@ router.get('/coverage-status', authorize(...COVERAGE_VIEW_ROLES), asyncHandler(a
             facilityId: targetFacilityId,
             timestamp: now.toISOString(),
             summary,
+            // Flat mirror of `summary` for the coverage panel, which reads these
+            // at the top level of `data` (it used to find none, default every
+            // count to 0 and show "Zero-Doctor Coverage" beside an Online roster).
+            // `onlineAvailableDoctors` here means "online right now" (available
+            // or in a session); `availableDoctors` is the available-only count.
+            onlineAvailableDoctors: summary.onlineDoctors,
+            availableDoctors: summary.onlineAvailableDoctors,
+            activeSessionDoctors: summary.inSessionDoctors,
+            onDutyScheduledDoctors: summary.scheduledOnShiftNow,
+            waitingPatientsCount: summary.waitingPatientsCount,
+            zeroDoctorAlert: summary.noDoctorsOnline,
+            coverageGapAlert: summary.noDoctorsOnline && summary.waitingPatientsCount > 0,
             ...(centralBreakdown ? { centralBreakdown } : {}),
             doctors,
         },
     });
 }));
 
+/**
+ * Who may page doctors to come online: the front line that sees waiting
+ * patients (nurses, midwives, reception, pharmacy counter staff, care-home
+ * nurses) and facility/platform admins. Doctors do not page each other, and
+ * lab/radiology technicians use the critical-result escalation instead.
+ */
 const NOTIFY_ON_DUTY_ROLES: UserRole[] = [
     'hospital_admin', 'clinic_admin', 'admin', 'super_admin', 'nurse', 'receptionist' as any,
     'pharmacist', 'pharmacy_admin', 'medicine_store_attendant' as any,
-    'doctor', 'midwife', 'care_home_nurse' as any, 'care_home_admin' as any,
-    'lab_technician', 'lab_admin', 'rad_technician', 'rad_admin',
+    'midwife', 'care_home_nurse' as any, 'care_home_admin' as any,
+    'lab_admin', 'rad_admin',
 ];
+
+const NOTIFY_ON_DUTY_ADMIN_ROLES = new Set([
+    'hospital_admin', 'clinic_admin', 'admin', 'super_admin', 'pharmacy_admin',
+    'care_home_admin', 'lab_admin', 'rad_admin',
+]);
+
+/** One page per caller per facility per minute, so the roster is not spammed. */
+export const NOTIFY_ON_DUTY_COOLDOWN_MS = 60 * 1000;
+const NOTIFY_ON_DUTY_MESSAGE_MAX = 500;
+
+function cleanPageMessage(raw: unknown): string | null {
+    if (typeof raw !== 'string') return null;
+    // eslint-disable-next-line no-control-regex
+    const text = raw.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, ' ').replace(/\s+/g, ' ').trim();
+    return text ? text.slice(0, NOTIFY_ON_DUTY_MESSAGE_MAX) : null;
+}
 
 /**
  * POST /api/v1/telehealth-queue/notify-on-duty
- * Sends an urgent notification to all scheduled/credentialed doctors in that
- * facility (or Central Network) to come online and attend to waiting patients.
+ * Pages the doctors on shift now for the caller's facility (or the Docarion
+ * central network) to come online. Falls back to every credentialed doctor in
+ * that scope only when nobody is on shift. Facility staff always page their
+ * own facility; a platform admin pages the facility they selected, or the
+ * central network — never every doctor on the platform.
  */
 router.post('/notify-on-duty', authorize(...NOTIFY_ON_DUTY_ROLES), asyncHandler(async (req: AuthRequest, res: Response) => {
     const user = req.user!;
@@ -2127,100 +2537,98 @@ router.post('/notify-on-duty', authorize(...NOTIFY_ON_DUTY_ROLES), asyncHandler(
         ? req.body.facilityId.trim()
         : (typeof req.query.facilityId === 'string' && req.query.facilityId.trim() ? req.query.facilityId.trim() : null);
 
-    let targetFacilityId: string | null = null;
+    let targetFacilityId: string;
     if (user.facilityId && !isPlatformQueueAdmin(user)) {
         targetFacilityId = user.facilityId;
     } else {
-        targetFacilityId = requestedFacilityId || activeFacilityContext(user)?.facilityId || user.facilityId || null;
+        targetFacilityId = requestedFacilityId || activeFacilityContext(user)?.facilityId || user.facilityId || CENTRAL_SCOPE;
+    }
+    // 'docarion-central' (a Central site admin's session) is the Central network.
+    if (isCentralScopeValue(targetFacilityId)) targetFacilityId = CENTRAL_SCOPE;
+
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(targetFacilityId)) {
+        res.status(400).json({ success: false, error: 'Invalid facility' });
+        return;
     }
 
-    const customMessage = typeof req.body?.message === 'string' && req.body.message.trim()
-        ? req.body.message.trim()
-        : null;
+    // Claim the cooldown atomically so parallel requests cannot double-page.
+    const throttleRef = firestore.collection('notifyOnDutyThrottle').doc(`${targetFacilityId}__${user.userId}`);
+    const lastMs = await firestore.runTransaction(async (tx: any) => {
+        const prev = (await tx.get(throttleRef)).data()?.lastAt;
+        const prevMs = prev ? toMillis(prev) : null;
+        if (prevMs && Date.now() - prevMs < NOTIFY_ON_DUTY_COOLDOWN_MS) return prevMs;
+        tx.set(throttleRef, { lastAt: new Date(), userId: user.userId, facilityId: targetFacilityId }, { merge: true });
+        return null;
+    });
+    if (lastMs) {
+        const retryAfterSeconds = Math.ceil((NOTIFY_ON_DUTY_COOLDOWN_MS - (Date.now() - lastMs)) / 1000);
+        res.setHeader('Retry-After', String(retryAfterSeconds));
+        res.status(429).json({
+            success: false,
+            error: `Doctors were paged a moment ago. You can page again in ${retryAfterSeconds} seconds.`,
+            code: 'NOTIFY_ON_DUTY_COOLDOWN',
+            retryAfterSeconds,
+        });
+        return;
+    }
 
-    const [doctorsSnap, waitingSnap] = await Promise.all([
-        collections.doctors.get(),
+    const customMessage = cleanPageMessage(req.body?.message);
+
+    const [roster, waitingSnap] = await Promise.all([
+        resolveOnDutyDoctors(targetFacilityId),
         collections.telehealthQueue.where('status', '==', 'waiting').get(),
     ]);
 
-    const activeRawDoctors = doctorsSnap.docs
-        .map((d: any) => ({
-            userId: d.data()?.userId || d.id,
-            data: () => ({ ...d.data(), userId: d.data()?.userId || d.id }),
-        }))
-        .filter((d: any) => {
-            const st = d.data()?.status;
-            return !st || st === 'active';
-        });
-
-    const credentialedDoctors = await filterCredentialedPrincipals(activeRawDoctors);
-    const matchedDoctors = credentialedDoctors.filter((d: any) => {
-        const doc = d.data();
-        if (!targetFacilityId || targetFacilityId === 'central') {
-            return !doc.facilityId || doc.doctorType === 'platform' || !targetFacilityId;
-        }
-        const allowed = [doc.facilityId, ...(Array.isArray(doc.allowedFacilityIds) ? doc.allowedFacilityIds : [])].filter(Boolean);
-        return allowed.includes(targetFacilityId);
-    });
-
     const waitingPatientsCount = waitingSnap.docs
         .map((d: any) => d.data())
-        .filter((entry: any) => {
-            if (!targetFacilityId) return true;
-            if (targetFacilityId === 'central') return !entry.facilityId;
-            return entry.facilityId === targetFacilityId;
-        }).length;
+        .filter((entry: any) => (targetFacilityId === CENTRAL_SCOPE ? isDocarionCentralRecord(entry) : entry.facilityId === targetFacilityId))
+        .length;
 
     const title = '🚨 Urgent Coverage Request: Patients Waiting';
     const body = customMessage
         || `There ${waitingPatientsCount === 1 ? 'is 1 patient' : `are ${waitingPatientsCount} patients`} waiting in the telehealth queue. Please go online and accept consultations immediately.`;
 
-    const notifiedDoctorIds: string[] = [];
-    for (const d of matchedDoctors) {
-        const doctorId = d.userId;
-        notifiedDoctorIds.push(doctorId);
-        if (!req.isSandbox) {
+    // Each doctor is paged exactly once.
+    const notifiedDoctorIds = roster.doctorIds;
+    if (!req.isSandbox) {
+        for (const doctorId of notifiedDoctorIds) {
             notificationService.sendToUser?.(doctorId, title, body, {
                 type: 'urgent_on_duty_coverage_request',
-                facilityId: targetFacilityId || '',
+                facilityId: targetFacilityId === CENTRAL_SCOPE ? '' : targetFacilityId,
                 waitingPatientsCount: String(waitingPatientsCount),
                 url: '/dashboard/telehealth/queue',
             })?.catch?.(() => {});
         }
     }
 
-    if (!req.isSandbox) {
-        notificationService.sendToFacilityStaff?.(
-            targetFacilityId && targetFacilityId !== 'central' ? targetFacilityId : null,
-            ['doctor'],
-            title,
-            body,
-            {
-                type: 'urgent_on_duty_coverage_request',
-                facilityId: targetFacilityId || '',
-                waitingPatientsCount: String(waitingPatientsCount),
-                url: '/dashboard/telehealth/queue',
-            },
-        )?.catch?.(() => {});
-    }
-
-    await logAudit(req, 'NOTIFY_ON_DUTY_DOCTORS', 'telehealthQueue', targetFacilityId || 'central', {
+    await logAudit(req, 'NOTIFY_ON_DUTY_DOCTORS', 'telehealthQueue', targetFacilityId, {
         details: {
             facilityId: targetFacilityId,
             notifiedCount: notifiedDoctorIds.length,
             notifiedDoctorIds,
+            onShiftNow: roster.onShiftNow,
             waitingPatientsCount,
+            customMessage: !!customMessage,
         },
     });
 
+    const message = notifiedDoctorIds.length === 0
+        ? 'No credentialed doctor was found to page for this facility.'
+        : roster.onShiftNow
+            ? `Urgent coverage alert sent to ${notifiedDoctorIds.length} doctor(s) on shift now.`
+            : `No doctor is on shift now, so all ${notifiedDoctorIds.length} credentialed doctor(s) were paged.`;
+
     res.json({
         success: true,
-        message: `Urgent coverage alert sent to ${notifiedDoctorIds.length} doctor(s).`,
+        message,
         data: {
-            facilityId: targetFacilityId,
+            facilityId: targetFacilityId === CENTRAL_SCOPE ? null : targetFacilityId,
+            scope: targetFacilityId === CENTRAL_SCOPE ? 'central' : 'facility',
             notifiedCount: notifiedDoctorIds.length,
-            notifiedDoctorIds,
+            onShiftNow: roster.onShiftNow,
             waitingPatientsCount,
+            // Doctor ids are for admins only; front-line staff get the count.
+            ...(NOTIFY_ON_DUTY_ADMIN_ROLES.has(user.role) ? { notifiedDoctorIds } : {}),
         },
     });
 }));

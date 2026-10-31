@@ -12,7 +12,6 @@ import {
   schedulingApi,
   walletApi,
   aiIntakeApi,
-  aiPrefillApi,
   authApi,
 } from '@/services/api';
 import { Card, CardContent } from '@/components/ui/Card';
@@ -53,6 +52,9 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { ComplianceBadges } from '@/components/ui/TrustBadge';
+import NextStepCard from '@/components/onboarding/NextStepCard';
+import MyScheduleCard from '@/components/patient/MyScheduleCard';
+import FirstRunGuide from '@/components/onboarding/FirstRunGuide';
 import { BrandLogoMark } from '@/components/ui/BrandLogo';
 import {
   PatientFacilityContextBar,
@@ -130,6 +132,7 @@ interface CareTeamMember {
 
 interface Appointment {
   appointmentId: string;
+  consultationId?: string | null;
   doctorName?: string;
   facilityId?: string;
   facilityName?: string;
@@ -222,44 +225,17 @@ function PatientDashboard() {
 
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Core record reads that failed on the last load. allSettled() lets the rest
+  // of the dashboard render, but a failed read must never look like "you have
+  // no consultations / prescriptions / lab results".
+  const [failedRecordReads, setFailedRecordReads] = useState<string[]>([]);
   const [pendingIntake, setPendingIntake] = useState<{ consultationId: string; specialtyName?: string } | null>(null);
 
-  // Vitals State
-  const [showVitalsModal, setShowVitalsModal] = useState(false);
-  const [vitalsForm, setVitalsForm] = useState({
-    systolic: '',
-    diastolic: '',
-    heartRate: '',
-    temperature: '',
-    oxygenSaturation: '',
-  });
+  // Vitals: patients see readings recorded by their care team (read-only).
+  // Owner decision (2026-10-28): patients at home are NOT offered self-entry of
+  // vitals until connected-device rollout — free-typed home readings invite
+  // made-up values that clinicians may then trust.
   const [latestVitals, setLatestVitals] = useState<any>(null);
-  const [aiText, setAiText] = useState('');
-  const [aiLoading, setAiLoading] = useState(false);
-
-  const handlePrefill = async () => {
-    if (!aiText.trim()) return;
-    setAiLoading(true);
-    try {
-      const res = await aiPrefillApi.parseText({ text: aiText, type: 'vitals' });
-      const data = res.data?.data;
-      if (data) {
-        setVitalsForm((prev) => ({
-          ...prev,
-          systolic: data.systolicBP?.toString() || data.systolic?.toString() || prev.systolic,
-          diastolic: data.diastolicBP?.toString() || data.diastolic?.toString() || prev.diastolic,
-          heartRate: data.heartRate?.toString() || prev.heartRate,
-          temperature: data.temperature?.toString() || prev.temperature,
-          oxygenSaturation: data.oxygenSaturation?.toString() || prev.oxygenSaturation,
-        }));
-        toast.success('AI pre-filled successfully');
-      }
-    } catch {
-      toast.error('AI pre-fill failed');
-    } finally {
-      setAiLoading(false);
-    }
-  };
 
   // AI Copilot State
   const [copilotQuery, setCopilotQuery] = useState('');
@@ -335,6 +311,14 @@ function PatientDashboard() {
         patientApi.getShortcuts(),
         patientApi.getLinkedFacilities(),
       ]);
+
+      setFailedRecordReads(
+        [
+          consultRes.status === 'rejected' ? 'consultations' : null,
+          prescRes.status === 'rejected' ? 'prescriptions' : null,
+          labRes.status === 'rejected' ? 'lab results' : null,
+        ].filter((x): x is string => x !== null)
+      );
 
       const allConsultations: Consultation[] =
         consultRes.status === 'fulfilled' ? consultRes.value.data?.data || [] : [];
@@ -537,9 +521,14 @@ function PatientDashboard() {
         }
       }
 
-      Promise.allSettled([schedulingApi.getAppointments({ status: 'confirmed' }), walletApi.getBalance()]).then(
+      // Booked visits land as `scheduled` (slot bookings) and become `confirmed`
+      // on check-in — filtering on `confirmed` alone hid every upcoming booking.
+      Promise.allSettled([schedulingApi.getAppointments(), walletApi.getBalance()]).then(
         ([apptRes, walletRes]) => {
-          if (apptRes.status === 'fulfilled') setAppointments(apptRes.value.data?.data || []);
+          if (apptRes.status === 'fulfilled') {
+            const rows: Appointment[] = apptRes.value.data?.data || [];
+            setAppointments(rows.filter((a) => ['scheduled', 'confirmed', 'pending', 'in_progress', 'completed'].includes(String(a.status))));
+          }
           if (walletRes.status === 'fulfilled') setWalletBalance(walletRes.value.data?.data?.balance ?? null);
         }
       );
@@ -613,29 +602,6 @@ function PatientDashboard() {
       );
     } finally {
       setRefillingId(null);
-    }
-  };
-
-  const submitVitals = async () => {
-    if (!vitalsForm.systolic && !vitalsForm.heartRate && !vitalsForm.temperature) {
-      toast.error('Please enter at least one vital reading');
-      return;
-    }
-    try {
-      const data: any = { recordedAt: new Date() };
-      if (vitalsForm.systolic && vitalsForm.diastolic)
-        data.bloodPressure = { systolic: +vitalsForm.systolic, diastolic: +vitalsForm.diastolic };
-      if (vitalsForm.heartRate) data.heartRate = +vitalsForm.heartRate;
-      if (vitalsForm.temperature) data.temperature = +vitalsForm.temperature;
-      if (vitalsForm.oxygenSaturation) data.oxygenSaturation = +vitalsForm.oxygenSaturation;
-
-      await patientApi.addVitals(data);
-      setLatestVitals(data);
-      toast.success('Vitals recorded successfully');
-      setShowVitalsModal(false);
-      setVitalsForm({ systolic: '', diastolic: '', heartRate: '', temperature: '', oxygenSaturation: '' });
-    } catch {
-      toast.error('Failed to record vitals');
     }
   };
 
@@ -739,22 +705,26 @@ function PatientDashboard() {
     const items: TimelineItem[] = [];
 
     appointments.forEach((a) => {
-      const d = new Date(`${a.date}T${a.startTime}`);
+      const d = new Date(`${a.date}T${a.startTime || '00:00'}`);
+      // The appointment's consultation (never the appointment id) is what the
+      // consult room, queue and video pages key on.
+      const consultId = a.consultationId || null;
       items.push({
         id: `appt-${a.appointmentId}`,
         type: 'appointment',
         date: d,
         title: `Appointment with ${a.doctorName || 'Doctor'}`,
-        subtitle: `${a.type === 'video' ? 'Video' : 'In-person'} · ${a.specialtyName || 'General'}`,
+        subtitle: `${a.type === 'video' ? 'Video' : a.type === 'chat' ? 'Chat' : 'In-person'} · ${a.specialtyName || 'General'}`,
         status: a.status,
         icon: <Calendar className="w-5 h-5" />,
-        actionUrl: d > new Date() ? `/consultations/${a.appointmentId}/video` : undefined,
-        actionText: d > new Date() && a.type === 'video' ? 'Join Call' : undefined,
+        actionUrl: consultId ? `/consultations/${consultId}` : undefined,
+        actionText: consultId ? (d > new Date() ? 'View' : 'Open') : undefined,
       });
     });
 
+    const appointmentConsultIds = new Set(appointments.map((a) => a.consultationId).filter(Boolean));
     consultations.forEach((c) => {
-      if (!appointments.some((a) => a.appointmentId === c.consultationId)) {
+      if (!appointmentConsultIds.has(c.consultationId)) {
         items.push({
           id: `cons-${c.consultationId}`,
           type: 'consultation',
@@ -927,6 +897,21 @@ function PatientDashboard() {
             </div>
           </div>
 
+          {/* PATIENT-FIRST: the front door is the triage AI → doctor. */}
+          <div className="mb-4">
+            <Link
+              href="/consultations/start"
+              className="group flex items-center justify-between gap-4 rounded-2xl bg-white text-green-800 px-5 py-4 shadow-elevated hover:bg-green-50 transition-colors dark:bg-slate-800 dark:text-green-200"
+              data-testid="hero-talk-to-doctor"
+            >
+              <span>
+                <span className="block text-lg font-bold">Talk to a doctor now</span>
+                <span className="block text-sm text-green-700/80 dark:text-green-300/80">Tell our AI what&apos;s wrong — the first available doctor sees it in minutes.</span>
+              </span>
+              <span className="text-2xl group-hover:translate-x-1 transition-transform" aria-hidden="true">→</span>
+            </Link>
+          </div>
+
           {/* AI COPILOT SEARCH BLOCK */}
           <div className="bg-white/10 backdrop-blur-md border border-white/20 rounded-2xl p-2 shadow-2xl">
             <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-0 sm:relative">
@@ -987,6 +972,27 @@ function PatientDashboard() {
       </div>
 
       <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 -mt-6 relative z-10 space-y-8">
+        {failedRecordReads.length > 0 && (
+          <div
+            role="alert"
+            data-testid="patient-records-load-warning"
+            className="bg-red-50 rounded-2xl p-4 shadow-card border border-red-200 flex items-center justify-between gap-3 flex-wrap dark:bg-red-900/20 dark:border-red-800"
+          >
+            <p className="text-sm text-red-800 dark:text-red-200">
+              We couldn&apos;t load your {failedRecordReads.join(', ')} right now, so this page may be incomplete.
+            </p>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="border-red-300 text-red-800 dark:text-red-200"
+              onClick={() => loadDashboardData()}
+            >
+              Try again
+            </Button>
+          </div>
+        )}
+
         {/* KYC Pending Banner */}
         {kycStatus !== 'verified' && kycStatus !== 'successful' && (
           <div className="bg-amber-50 rounded-2xl p-5 shadow-card border border-amber-100 hover:shadow-card-hover flex items-center justify-between group hover:border-amber-300 transition-colors dark:bg-amber-900/20">
@@ -1010,6 +1016,13 @@ function PatientDashboard() {
             </Link>
           </div>
         )}
+
+        {/* What to do next — driven by the latest consultation's phase */}
+        <NextStepCard consultations={consultations as any} />
+        <FirstRunGuide />
+        {/* Everything coming up: visits, doses, tests to book, imaging, recalls */}
+        <MyScheduleCard className="mb-6" />
+
 
         {/* Pending Intake Banner */}
         {pendingIntake && (
@@ -1447,20 +1460,15 @@ function PatientDashboard() {
                 </CardContent>
               </Card>
             )}
-            <div className="flex gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                className="flex-1 rounded-xl border-rose-200 text-rose-700 hover:bg-rose-50"
-                onClick={() => setShowVitalsModal(true)}
-              >
-                Record vitals
-              </Button>
-              <Link href="/patient-vitals">
-                <Button type="button" variant="outline" className="rounded-xl border-rose-200 text-rose-700 hover:bg-rose-50">
+            <div className="space-y-2">
+              <Link href="/patient-vitals" className="block">
+                <Button type="button" variant="outline" className="w-full rounded-xl border-rose-200 text-rose-700 hover:bg-rose-50">
                   View all vitals
                 </Button>
               </Link>
+              <p className="text-xs text-gray-500 dark:text-gray-400" data-testid="patient-vitals-care-team-note">
+                Vitals are recorded by your care team during visits.
+              </p>
             </div>
 
             {/* Refill Suggestions */}
@@ -1922,146 +1930,6 @@ function PatientDashboard() {
         </div>
       )}
 
-      {/* Vitals Update Modal */}
-      {showVitalsModal && (
-        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-elevated animate-scale-in dark:bg-slate-800">
-            <div className="flex justify-between items-center mb-6">
-              <h3 className="text-xl font-bold tracking-tight text-gray-900 dark:text-white">Record Vitals</h3>
-              <button
-                onClick={() => setShowVitalsModal(false)}
-                className="w-8 h-8 flex items-center justify-center rounded-full bg-slate-100 text-slate-500 hover:bg-slate-200 dark:text-gray-400 dark:bg-slate-700"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="space-y-4">
-              <div className="mb-4 p-3 bg-green-50/60 rounded-xl border border-green-100">
-                <label className="block text-xs font-semibold text-emerald-800 mb-2">✨ AI Vitals Parsing</label>
-                <textarea
-                  className="w-full text-sm p-2.5 rounded-xl border border-green-200 mb-2 focus:outline-none focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all"
-                  rows={2}
-                  placeholder="Paste vitals dictation here..."
-                  value={aiText}
-                  onChange={(e) => setAiText(e.target.value)}
-                />
-                <Button
-                  type="button"
-                  size="sm"
-                  className="w-full bg-green-600 hover:bg-green-700 text-white rounded-xl"
-                  onClick={handlePrefill}
-                  disabled={aiLoading || !aiText.trim()}
-                >
-                  {aiLoading ? 'Extracting...' : 'Auto-fill from Text'}
-                </Button>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider dark:text-gray-400">
-                    Systolic
-                  </label>
-                  <div className="relative">
-                    <input
-                      type="number"
-                      placeholder="120"
-                      value={vitalsForm.systolic}
-                      onChange={(e) => setVitalsForm((p) => ({ ...p, systolic: e.target.value }))}
-                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:ring-2 focus:ring-rose-500 focus:border-rose-500 transition-all outline-none dark:text-gray-100 dark:bg-slate-800"
-                    />
-                    <span className="absolute right-4 top-1/2 -translate-y-1/2 text-xs text-slate-500 font-medium dark:text-gray-400">
-                      mmHg
-                    </span>
-                  </div>
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider dark:text-gray-400">
-                    Diastolic
-                  </label>
-                  <div className="relative">
-                    <input
-                      type="number"
-                      placeholder="80"
-                      value={vitalsForm.diastolic}
-                      onChange={(e) => setVitalsForm((p) => ({ ...p, diastolic: e.target.value }))}
-                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:ring-2 focus:ring-rose-500 focus:border-rose-500 transition-all outline-none dark:text-gray-100 dark:bg-slate-800"
-                    />
-                    <span className="absolute right-4 top-1/2 -translate-y-1/2 text-xs text-slate-500 font-medium dark:text-gray-400">
-                      mmHg
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider dark:text-gray-400">
-                  Heart Rate
-                </label>
-                <div className="relative">
-                  <input
-                    type="number"
-                    placeholder="72"
-                    value={vitalsForm.heartRate}
-                    onChange={(e) => setVitalsForm((p) => ({ ...p, heartRate: e.target.value }))}
-                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:ring-2 focus:ring-rose-500 focus:border-rose-500 transition-all outline-none dark:text-gray-100 dark:bg-slate-800"
-                  />
-                  <span className="absolute right-4 top-1/2 -translate-y-1/2 text-xs text-slate-500 font-medium dark:text-gray-400">
-                    bpm
-                  </span>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider dark:text-gray-400">
-                    Temperature
-                  </label>
-                  <div className="relative">
-                    <input
-                      type="number"
-                      step="0.1"
-                      placeholder="36.8"
-                      value={vitalsForm.temperature}
-                      onChange={(e) => setVitalsForm((p) => ({ ...p, temperature: e.target.value }))}
-                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:ring-2 focus:ring-rose-500 focus:border-rose-500 transition-all outline-none dark:text-gray-100 dark:bg-slate-800"
-                    />
-                    <span className="absolute right-4 top-1/2 -translate-y-1/2 text-xs text-slate-500 font-medium dark:text-gray-400">
-                      °C
-                    </span>
-                  </div>
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider dark:text-gray-400">
-                    SpO2
-                  </label>
-                  <div className="relative">
-                    <input
-                      type="number"
-                      placeholder="98"
-                      value={vitalsForm.oxygenSaturation}
-                      onChange={(e) => setVitalsForm((p) => ({ ...p, oxygenSaturation: e.target.value }))}
-                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:ring-2 focus:ring-rose-500 focus:border-rose-500 transition-all outline-none dark:text-gray-100 dark:bg-slate-800"
-                    />
-                    <span className="absolute right-4 top-1/2 -translate-y-1/2 text-xs text-slate-500 font-medium dark:text-gray-400">
-                      %
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="pt-4">
-                <Button
-                  onClick={submitVitals}
-                  className="w-full bg-rose-600 hover:bg-rose-700 text-white rounded-xl py-6 text-base font-bold shadow-lg shadow-rose-600/20"
-                >
-                  Save Vitals to Record
-                </Button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
       <BottomNav />
       {/* Drawers and Modals */}
       <AICopilotDrawer
@@ -2072,7 +1940,7 @@ function PatientDashboard() {
         initialQuery={copilotQuery}
       />
 
-      <BookingDrawer isOpen={bookingOpen} onClose={() => setBookingOpen(false)} />
+      <BookingDrawer isOpen={bookingOpen} onClose={() => setBookingOpen(false)} onBooked={() => { void loadDashboardData(); }} />
 
       {quickChatDoc && (
         <QuickChatWidget

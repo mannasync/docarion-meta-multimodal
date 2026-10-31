@@ -2,17 +2,25 @@ import { Router, Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import { asyncHandler } from '../middleware/error.middleware';
 import { authenticate, authorize, AuthRequest } from '../middleware/auth.middleware';
+import { allowCareStation, allowCareStationStaff } from '../middleware/care-station-access.middleware';
 import {
-    conductIntake, getIntakeStatus, getPhysicianBrief, GuestSessionConflictError,
+    conductIntake, getIntakeStatus, getPhysicianBrief, GuestSessionConflictError, generatePhysicianBrief,
 } from '../services/ai-intake.service';
-import { collections } from '../config/database';
+import { createQueueEntryForConsultation, markQueueEntryIntakeComplete } from '../services/queue-entry.service';
+import { computeCompleteness } from '../services/intake-history.service';
+import { verifyGuestSession, GUEST_SESSION_ID_RE } from '../services/guest-session-token.service';
+import { IntakeLocationContext, NearestEmergencyFacility, findNearestEmergencyFacilities, attachNearestEmergencyServices } from '../services/intake-emergency.service';
+import type { NearestEmergencyService } from '../services/emergency-services.service';
+import { collections, firestore } from '../config/database';
 import {
     canViewConsultationClinicalData,
     canViewPhysicianBrief,
     isPlatformAdmin,
     ConsultationContext,
 } from '../utils/consultation-access';
+import { resolveDoctorScope, facilityUsesPlatformDoctorsAt } from '../services/doctor-scope.service';
 import { facilityContextRequiredBody, platformCanSeeFacility } from '../utils/platform-facility-context';
+import { logAudit } from '../services/audit.service';
 import { haversineKm, extractCoordinates } from '../utils/geo';
 import { validatePointOfCareTests, sanitizePointOfCareTests } from '../utils/point-of-care';
 import { FieldValue } from '../config/database';
@@ -24,11 +32,15 @@ import { issueRecordIdentifierFields } from '../services/identifier.service';
 import { ensureEncounterForConsultation } from '../services/identifier-coverage.service';
 import { requireCompletedCredential } from '../middleware/credential-gate.middleware';
 import { cleanDisplayName } from '../utils/person-name';
+import { clientIp } from '../utils/client-ip';
+import { estimateState } from '../utils/nigeria-states';
+import { claimOrVerifyGuestSession, guestTokenFrom } from '../services/guest-session-token.service';
 import { medicalVisionService } from '../services/medical-vision.service';
 import { nafdacVerificationService } from '../services/nafdac-verification.service';
-import { callVoiceDiarizationService } from '../services/call-voice-diarization.service';
+import { callVoiceDiarizationService, DiarizationUnavailableError } from '../services/call-voice-diarization.service';
 import { aiCopilotService } from '../services/ai-copilot.service';
 import { trainingDataService } from '../services/training-data.service';
+import { centralRecordFacilityId, partnerSiteIdOf } from '../config/tenancy';
 
 const router = Router();
 
@@ -71,6 +83,22 @@ const intakeLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
 });
+
+/**
+ * A registered Care Station device (services/care-station.service.ts). Only
+ * the patient-facing Care Station routes accept it (allowCareStation).
+ */
+const STATION_DEVICE = 'care_station' as any;
+
+/**
+ * A Care Station device may only act on intake sessions it created itself
+ * (its own check-ins). Staff are unaffected. Returns false for any other
+ * session so the caller can answer 404 without disclosing it exists.
+ */
+function stationMaySeeSession(user: AuthRequest['user'], sessionData: any): boolean {
+    if (user?.role !== STATION_DEVICE) return true;
+    return !!sessionData && sessionData.createdByStationId === (user as any).stationId;
+}
 
 /** Facility staff roles allowed to operate walk-in intake (C1). */
 const WALK_IN_STAFF_ROLES = [
@@ -254,6 +282,7 @@ async function findNearestFacility(lat: number, lng: number) {
                     facilityId: facility.facilityId || facility.id,
                     facilityName: facility.name,
                     type: facility.type,
+                    state: facility.address?.state || facility.state || null,
                     distance: distance
                 };
             }
@@ -267,6 +296,7 @@ async function findNearestFacility(lat: number, lng: number) {
             facilityId: nearest.facilityId,
             facilityName: nearest.facilityName,
             type: nearest.type,
+            state: nearest.state,
             distance: `${Math.round(minDistance)}m`
         };
     }
@@ -277,6 +307,7 @@ async function findNearestFacility(lat: number, lng: number) {
             facilityId: nearest.facilityId,
             facilityName: nearest.facilityName,
             type: nearest.type,
+            state: nearest.state,
             distance: `${Math.round(minDistance)}m`
         } : null
     };
@@ -295,6 +326,180 @@ function transportSafeSessionName(sessionData: any): string | null {
     return cleanDisplayName([sessionData.firstName, sessionData.lastName].filter(Boolean).join(' '));
 }
 
+// ============================================================
+// POST /ai-intake/guest/:sessionId/attach — guest → account conversion
+// ============================================================
+// A patient who started the AI triage as a GUEST (web /triage, patient-app
+// guest intake) signs up and continues WITHOUT repeating themselves: the guest
+// session (transcript, history state, triage, red flags) is copied into a new
+// consultation owned by the signed-in patient, which is then queued (or marked
+// intake_complete and briefed) exactly as an authenticated intake would be.
+//
+// Security (C2): binding requires the guest token minted on the first guest
+// message; the guest doc is COPIED to a brand-new consultation id, never merged
+// into any existing patient session, and carry-over seeding never runs.
+router.post('/guest/:sessionId/attach', authenticate, authorize('patient'), intakeLimiter,
+    asyncHandler(async (req: AuthRequest, res: Response) => {
+        const sessionId = String(req.params.sessionId || '').trim();
+        if (!GUEST_SESSION_ID_RE.test(sessionId)) {
+            res.status(400).json({ success: false, error: 'Invalid session id' });
+            return;
+        }
+        const tokenOk = await verifyGuestSession(sessionId, guestTokenFrom(req));
+        if (!tokenOk) {
+            res.status(403).json({ success: false, code: 'GUEST_TOKEN_INVALID', error: 'This symptom check could not be verified. Please start a new one.' });
+            return;
+        }
+
+        const guestDoc = await collections.intakeSessions.doc(sessionId).get();
+        if (!guestDoc.exists) {
+            res.status(404).json({ success: false, error: 'Session not found' });
+            return;
+        }
+        const guest: any = guestDoc.data() || {};
+        const patientId = req.user!.userId;
+
+        // Already attached by this patient → idempotent.
+        if (guest.patientId && guest.patientId !== patientId) {
+            res.status(409).json({ success: false, code: 'SESSION_OTHER_ACCOUNT', error: 'This symptom check belongs to another account.' });
+            return;
+        }
+        if (guest.patientId === patientId && guest.attachedToConsultationId) {
+            const existing = await collections.consultations.doc(guest.attachedToConsultationId).get();
+            if (existing.exists) {
+                res.json({
+                    success: true,
+                    data: attachResponse(guest.attachedToConsultationId, existing.data() || {}, guest, true),
+                });
+                return;
+            }
+        }
+
+        // ── Create the patient's consultation (instant, general) ──
+        const consultationId = uuidv4();
+        // The guest route stamps `facilityId` on the session only when the
+        // patient was confirmed INSIDE a facility (Care Station / verified desk).
+        const facilityId: string | null = guest.facilityId ? String(guest.facilityId) : null;
+        const identifier = await issueRecordIdentifierFields('consultation', consultationId, { facilityId });
+        const chiefComplaint: string | null =
+            guest.historyState?.chiefComplaint?.text
+            || guest.historyState?.chiefComplaint
+            || (Array.isArray(guest.messages) ? guest.messages.find((m: any) => m?.role === 'user')?.content : null)
+            || null;
+        const isComplete = guest.isComplete === true;
+        const emergency = guest.emergencyDetected === true;
+        const triage = guest.triage || null;
+        const now = new Date();
+        const consultation: Record<string, any> = {
+            consultationId,
+            ...identifier,
+            patientId,
+            is_sandbox: req.isSandbox || false,
+            doctorId: null,
+            facilityId: centralRecordFacilityId(facilityId),
+            type: 'video',
+            mode: 'instant',
+            specialtyId: 'general',
+            status: isComplete ? 'intake_complete' : 'pending',
+            scheduledAt: now,
+            symptoms: chiefComplaint ? [String(chiefComplaint).slice(0, 2000)] : [],
+            preferredLanguage: guest.language || guest.historyState?.language || 'en',
+            intakeSessionId: sessionId,
+            attachedFromGuestSessionId: sessionId,
+            fee: 0,
+            paymentStatus: 'completed',
+            ...(emergency && {
+                urgencyLevel: 'emergency', esiLevel: 1, triageColor: 'red', triageCategory: 'emergency',
+                emergencyDetectedAt: guest.emergencyDetectedAt || now,
+                intakeRedFlags: (guest.redFlags || []).map((f: any) => ({ id: f.id, label: f.label, severity: f.severity })),
+            }),
+            ...(!emergency && triage?.category && {
+                triageCategory: triage.category, esiLevel: triage.esiLevel ?? null, triagedAt: now, triageReason: triage.reason || null,
+                urgencyLevel: triage.category === 'urgent' ? 'high' : 'low',
+            }),
+            ...(isComplete && { intakeCompleted: true, intakeCompletedAt: guest.completedAt || now }),
+            createdAt: now,
+            updatedAt: now,
+        };
+        await collections.consultations.doc(consultationId).set(consultation);
+        await ensureEncounterForConsultation(consultationId, consultation).catch(() => null);
+
+        // ── Copy the guest session onto the consultation id (the intake session id IS the consultation id) ──
+        const { guest: _g, anonymousClientKey: _k, ...rest } = guest;
+        await collections.intakeSessions.doc(consultationId).set({
+            ...rest,
+            id: consultationId,
+            consultationId,
+            patientId,
+            attachedFromGuestSessionId: sessionId,
+            attachedAt: now,
+            updatedAt: now,
+        });
+        await collections.intakeSessions.doc(sessionId).set({
+            patientId,
+            attachedToConsultationId: consultationId,
+            attachedAt: now,
+        }, { merge: true });
+        // The guest secret has done its job.
+        await firestore.collection('guestSessionTokens').doc(sessionId).delete().catch(() => { });
+
+        // ── Queue: hidden until the intake completes; emergencies surface at once ──
+        let patientName = 'Patient';
+        try {
+            const u = (await collections.users.doc(patientId).get()).data();
+            patientName = `${u?.profile?.firstName || u?.firstName || ''} ${u?.profile?.lastName || u?.lastName || ''}`.trim() || u?.email || 'Patient';
+        } catch { /* best-effort */ }
+        const queueEntry = await createQueueEntryForConsultation({
+            consultationId,
+            patientId,
+            patientName,
+            facilityId,
+            symptoms: consultation.symptoms,
+            urgencyLevel: consultation.urgencyLevel || 'low',
+            triageCategory: consultation.triageCategory || null,
+            preferredLanguage: consultation.preferredLanguage,
+            isSandbox: req.isSandbox || false,
+            intakePending: !isComplete && !emergency,
+            consentMethod: 'guest_intake_attach',
+        }).catch(() => null);
+        if (isComplete || emergency) {
+            await markQueueEntryIntakeComplete(consultationId, { emergency }).catch(() => null);
+            generatePhysicianBrief(consultationId).catch(() => { /* lazily regenerated on GET /brief */ });
+        }
+        consultation.queueId = queueEntry?.queueId || null;
+
+        res.status(201).json({ success: true, data: attachResponse(consultationId, consultation, guest, false) });
+    })
+);
+
+/** Patient-safe projection of an attached session (never differentials/brief). */
+function attachResponse(consultationId: string, consultation: any, session: any, reused: boolean) {
+    const messages = (Array.isArray(session.messages) ? session.messages : [])
+        .filter((m: any) => m && (m.role === 'user' || m.role === 'assistant'))
+        .map((m: any) => ({ role: m.role, content: String(m.content ?? ''), timestamp: m.timestamp ?? null }));
+    const triage = session.triage
+        ? { category: session.triage.category, esiLevel: session.triage.esiLevel ?? null, reason: session.triage.reason ?? null }
+        : null;
+    let completenessRaw: number | null = null;
+    try {
+        completenessRaw = session.historyState ? computeCompleteness(session.historyState).percent : null;
+    } catch { completenessRaw = null; }
+    return {
+        consultationId,
+        queueId: consultation.queueId ?? null,
+        status: consultation.status ?? 'pending',
+        isComplete: session.isComplete === true,
+        questionNumber: Number(session.turnCount) || messages.filter((m: any) => m.role === 'user').length,
+        totalExpected: 18,
+        messages,
+        triage,
+        completeness: typeof completenessRaw === 'number' ? completenessRaw : null,
+        emergencyDetected: session.emergencyDetected === true,
+        language: session.language || session.historyState?.language || 'en',
+        reused,
+    };
+}
+
 // POST /ai-intake/guest — Unauthenticated frictionless triage
 router.post('/guest', intakeLimiter, asyncHandler(async (req: Request, res: Response) => {
     const { message, sessionId, language, lat, lng, firstName, walkInCode } = req.body;
@@ -307,6 +512,14 @@ router.post('/guest', intakeLimiter, asyncHandler(async (req: Request, res: Resp
     const allowedLanguages = ['en', 'pcm', 'ha', 'yo', 'ig', 'fr'];
     const validLanguage = allowedLanguages.includes(language) ? language : 'en';
 
+    // The guest session id is client-chosen and guessable: the first message
+    // mints a secret (returned once) that every later message must carry.
+    const guestClaim = await claimOrVerifyGuestSession(String(sessionId), guestTokenFrom(req));
+    if (!guestClaim.ok) {
+        res.status(404).json({ success: false, error: 'Session not found. Please start a new symptom check.' });
+        return;
+    }
+
     // We reuse conductIntake using sessionId as consultationId.
     // C2 — guest flag: the service refuses to bind to (or seed history from) a
     // real patient's consultation/session and never runs carry-over seeding.
@@ -316,21 +529,68 @@ router.post('/guest', intakeLimiter, asyncHandler(async (req: Request, res: Resp
         return;
     }
 
+    // Location is resolved BEFORE the AI turn so an emergency on this very
+    // message gets the right advice. A guest is unauthenticated and both the
+    // coordinates and the 4-digit desk code are client-supplied, so a facility
+    // match is never trusted as "inside the facility": it is marked unverified,
+    // which gives both the "tell staff" and the "go to the nearest hospital" advice and never
+    // fires a lock-screen alert at that facility's staff.
+    let facilityContext = null;
+    if (lat && lng) {
+        facilityContext = await findNearestFacility(Number(lat), Number(lng));
+    }
+    let guestFacility: { facilityId: string; facilityName?: string | null; type?: string | null } | null = null;
+    if (facilityContext?.in_facility && facilityContext.facilityId) {
+        guestFacility = { facilityId: facilityContext.facilityId, facilityName: facilityContext.facilityName, type: facilityContext.type };
+    } else if (!facilityContext) {
+        const priorSession = (await collections.intakeSessions.doc(sessionId).get()).data();
+        if (priorSession?.facilityId && !priorSession?.patientId) {
+            guestFacility = { facilityId: priorSession.facilityId, facilityName: priorSession.facilityName };
+        }
+    }
+    const guestLocation: IntakeLocationContext = guestFacility
+        ? {
+            kind: 'in_facility',
+            facilityId: guestFacility.facilityId,
+            facilityName: guestFacility.facilityName || null,
+            facilityType: guestFacility.type || null,
+            edCapable: false,
+            unverified: true,
+            source: 'guest_geo',
+        }
+        : { kind: 'home', source: 'guest' };
+    // Approximate area for the call-back (regional admin). Rounded to ~100 m.
+    if (facilityContext) {
+        const near: any = facilityContext.in_facility ? facilityContext : facilityContext.nearestFacility;
+        const latN = Number(lat);
+        const lngN = Number(lng);
+        guestLocation.approxLocation = {
+            state: estimateState(latN, lngN, {
+                state: near?.state,
+                distanceKm: near?.distance ? parseInt(String(near.distance), 10) / 1000 : null,
+            }),
+            lat: Number.isFinite(latN) ? Math.round(latN * 1000) / 1000 : null,
+            lng: Number.isFinite(lngN) ? Math.round(lngN * 1000) / 1000 : null,
+            nearestFacilityName: near?.facilityName || null,
+        };
+    }
+
     let result;
     try {
-        result = await conductIntake(message.trim(), sessionId, validLanguage, { guest: true });
+        // Hashed client address: only used to limit how many anonymous emergencies
+        // one device can page admins with. Never stored in clear.
+        const anonymousClientKey = crypto
+            .createHmac('sha256', process.env.JWT_SECRET || 'docarion')
+            .update(clientIp(req) || 'unknown')
+            .digest('hex')
+            .slice(0, 32);
+        result = await conductIntake(message.trim(), sessionId, validLanguage, { guest: true, location: guestLocation, anonymousClientKey });
     } catch (e) {
         if (e instanceof GuestSessionConflictError) {
             res.status(400).json({ success: false, error: e.message });
             return;
         }
         throw e;
-    }
-
-    // Calculate dynamic coordinates-based facility matching
-    let facilityContext = null;
-    if (lat && lng) {
-        facilityContext = await findNearestFacility(Number(lat), Number(lng));
     }
 
     // Save/update session metadata in Firestore
@@ -356,7 +616,8 @@ router.post('/guest', intakeLimiter, asyncHandler(async (req: Request, res: Resp
         sessionUpdate.facilityId = facilityContext.facilityId;
         sessionUpdate.facilityName = facilityContext.facilityName;
         sessionUpdate.inFacility = true;
-        
+        sessionUpdate.unverifiedLocation = true;
+
         // Only set status if it doesn't already exist to avoid overwriting nurse vitals status
         const sessionDoc = await collections.intakeSessions.doc(sessionId).get();
         if (!sessionDoc.exists || !sessionDoc.data()?.status) {
@@ -366,7 +627,33 @@ router.post('/guest', intakeLimiter, asyncHandler(async (req: Request, res: Resp
     
     await collections.intakeSessions.doc(sessionId).set(sessionUpdate, { merge: true });
 
-    res.json({ success: true, data: { ...result, facilityContext } });
+    // A patient who can travel is shown the closest emergency-capable care.
+    let nearestEmergencyFacilities: NearestEmergencyFacility[] = [];
+    if (result.emergencyDetected && lat && lng) {
+        nearestEmergencyFacilities = await findNearestEmergencyFacilities(Number(lat), Number(lng), { limit: 3 })
+            .catch(() => []);
+    }
+    // Verified PRIVATE emergency-transport providers (independent, fees apply)
+    // as an aid to reaching hospital — never a reason to wait at home.
+    let nearestEmergencyServices: NearestEmergencyService[] = [];
+    if (result.emergencyDetected && (lat && lng || guestLocation.approxLocation?.state)) {
+        nearestEmergencyServices = await attachNearestEmergencyServices(
+            lat && lng ? Number(lat) : null,
+            lat && lng ? Number(lng) : null,
+            guestLocation.approxLocation?.state ?? null,
+        );
+    }
+
+    res.json({
+        success: true,
+        data: {
+            ...result,
+            facilityContext,
+            nearestEmergencyFacilities,
+            nearestEmergencyServices,
+            ...(guestClaim.newToken ? { guestToken: guestClaim.newToken } : {}),
+        },
+    });
 }));
 
 function normalizePhoneVariants(rawPhone?: string | null): string[] {
@@ -534,7 +821,7 @@ async function lookupOrCreatePatientForCareStation(params: {
 }
 
 // POST /ai-intake/care-station/patient-lookup — Search or auto-create a patient account by phone/email/MRN
-router.post('/care-station/patient-lookup', authenticate, authorize(...WALK_IN_STAFF_ROLES),
+router.post('/care-station/patient-lookup', allowCareStation, authenticate, authorize(...WALK_IN_STAFF_ROLES, STATION_DEVICE),
     asyncHandler(async (req: AuthRequest, res: Response) => {
         const {
             phone,
@@ -548,6 +835,15 @@ router.post('/care-station/patient-lookup', authenticate, authorize(...WALK_IN_S
             dateOfBirth,
             createIfMissing,
         } = req.body || {};
+
+        // A self-service kiosk is a public screen: it never learns whether an
+        // account exists, never sees anyone's details and never creates
+        // accounts. The check-in is recorded as typed and linked to an account
+        // only by staff or by the patient signing in on their own phone.
+        if (req.user!.role === STATION_DEVICE) {
+            res.json({ success: true, data: { found: false, patient: null, stationCheckIn: true } });
+            return;
+        }
 
         if (!phone && !email && !mrn && !createIfMissing) {
             res.status(400).json({
@@ -609,17 +905,71 @@ router.get('/walk-ins', authenticate, authorize(...WALK_IN_STAFF_ROLES), require
                 mrn: data.mrn || null,
                 chiefComplaint: data.chiefComplaint || null,
                 triageCategory: data.triage?.category || null,
+                // Placed here only by a guest's own coordinates: not confirmed
+                // to be in the building. Shown flagged and never ranked first.
+                unverifiedLocation: data.unverifiedLocation === true,
                 updatedAt: data.updatedAt
             };
         })
         .filter(p => p.status !== 'sent_to_doctor')
         .sort((a, b) => {
+            // Emergencies first (the patient is told they are moved to the
+            // front of the queue), then urgent, then most recently updated.
+            const rank = (c: string | null, unverified: boolean) =>
+                (unverified ? 10 : 0) + (c === 'emergency' ? 0 : c === 'urgent' ? 1 : 2);
+            const byTriage = rank(a.triageCategory, a.unverifiedLocation) - rank(b.triageCategory, b.unverifiedLocation);
+            if (byTriage !== 0) return byTriage;
             const dateA = a.updatedAt?.toDate?.() || new Date(a.updatedAt || 0);
             const dateB = b.updatedAt?.toDate?.() || new Date(b.updatedAt || 0);
             return dateB.getTime() - dateA.getTime();
         });
 
     res.json({ success: true, data: walkIns });
+}));
+
+// DELETE /ai-intake/walk-ins/:sessionId — close a front-desk session that will
+// not be seen (patient left, duplicate, registered in error). Reason required;
+// facility from the token; nothing clinical is deleted. (Audit 2026-10-29 O3.)
+router.delete('/walk-ins/:sessionId', allowCareStationStaff, authenticate, authorize(...WALK_IN_STAFF_ROLES), intakeLimiter,
+    asyncHandler(async (req: AuthRequest, res: Response) => {
+    const reason = typeof (req.body?.reason ?? req.query.reason) === 'string' ? String(req.body?.reason ?? req.query.reason).trim().slice(0, 300) : '';
+    if (reason.length < 3) {
+        res.status(400).json({ success: false, error: 'A reason is required to close a walk-in', code: 'REASON_REQUIRED' });
+        return;
+    }
+    const ref = collections.intakeSessions.doc(req.params.sessionId);
+    const sessionDoc = await ref.get();
+    if (!sessionDoc.exists) {
+        res.status(404).json({ success: false, error: 'Intake session not found' });
+        return;
+    }
+    const session: any = sessionDoc.data();
+    const sessionFacilityId = session?.facilityId || null;
+    if (!(req.user!.facilityId && req.user!.facilityId === sessionFacilityId)
+        && !platformCanSeeFacility(req.user!, sessionFacilityId)) {
+        if (isPlatformAdmin(req.user!) && !req.user!.facilityId) {
+            res.status(403).json(facilityContextRequiredBody(sessionFacilityId));
+            return;
+        }
+        res.status(403).json({ success: false, error: 'This walk-in belongs to another facility.' });
+        return;
+    }
+    if (['sent_to_doctor', 'cancelled', 'expired', 'completed'].includes(String(session?.status))) {
+        res.status(409).json({ success: false, error: `This walk-in is already ${session.status}`, code: 'NOT_OPEN' });
+        return;
+    }
+    await ref.update({
+        status: 'cancelled',
+        cancelledAt: new Date(),
+        cancelledBy: req.user!.userId,
+        cancelledByRole: req.user!.role,
+        cancelReason: reason,
+        updatedAt: new Date(),
+    });
+    await logAudit(req, 'WALKIN_CLOSED', 'intakeSession', req.params.sessionId, {
+        details: { reason, previousStatus: session?.status || null }, facilityId: sessionFacilityId || undefined,
+    });
+    res.json({ success: true, message: 'Walk-in closed', data: { sessionId: req.params.sessionId, status: 'cancelled' } });
 }));
 
 // POST /ai-intake/walk-ins — Register a walk-in from the front desk / Pro app.
@@ -635,15 +985,31 @@ router.get('/walk-ins', authenticate, authorize(...WALK_IN_STAFF_ROLES), require
 // episode. The gate is a NO-OP for roles with no regulated credential (facility
 // admins, front-desk accounts), so this blocks the unlicensed clinician without
 // closing the front desk.
-router.post('/walk-ins', authenticate, authorize(...WALK_IN_STAFF_ROLES), requireCompletedCredential(), intakeLimiter,
+/**
+ * Apply a staff-only gate to every caller except a registered Care Station
+ * device (which is not a person and has no licence). Staff stay walled.
+ */
+function exceptStationDevice(gate: (req: AuthRequest, res: Response, next: (err?: any) => void) => any) {
+    return (req: AuthRequest, res: Response, next: (err?: any) => void) =>
+        (req.user?.role === STATION_DEVICE ? next() : gate(req, res, next));
+}
+
+// A registered Care Station may also check a patient in.
+router.post('/walk-ins', allowCareStation, authenticate, authorize(...WALK_IN_STAFF_ROLES, STATION_DEVICE), exceptStationDevice(requireCompletedCredential()), intakeLimiter,
     asyncHandler(async (req: AuthRequest, res: Response) => {
     const facilityId = req.user!.facilityId;
+    const fromStation = req.user!.role === STATION_DEVICE;
     if (!facilityId) {
         res.status(400).json({ success: false, error: 'Your account is not assigned to a facility.' });
         return;
     }
 
-    const { patientName, phone, age, gender, dateOfBirth, chiefComplaint, triageCategory, patientId: explicitPatientId } = req.body || {};
+    const body = req.body || {};
+    const { patientName, phone, age, gender, dateOfBirth, chiefComplaint } = body;
+    // At a self-service station only staff assign triage, and a patient is
+    // linked only through the phone lookup — never by a typed patient id.
+    const triageCategory = fromStation ? undefined : body.triageCategory;
+    const explicitPatientId = fromStation ? undefined : body.patientId;
     const name = typeof patientName === 'string' ? patientName.trim().slice(0, 120) : '';
     if (!name) {
         res.status(400).json({ success: false, error: 'patientName is required' });
@@ -654,7 +1020,9 @@ router.post('/walk-ins', authenticate, authorize(...WALK_IN_STAFF_ROLES), requir
     let linkedMrn: string | null = null;
     let isExistingAccount = false;
 
-    if (typeof phone === 'string' && phone.trim().length > 0) {
+    if (fromStation) {
+        // Kiosk check-in: never bound to an account by a typed phone number.
+    } else if (typeof phone === 'string' && phone.trim().length > 0) {
         const lookupResult = await lookupOrCreatePatientForCareStation({
             phone: phone.trim(),
             fullName: name,
@@ -693,7 +1061,8 @@ router.post('/walk-ins', authenticate, authorize(...WALK_IN_STAFF_ROLES), requir
         facilityId,
         inFacility: true,
         registeredBy: req.user!.userId,
-        source: 'staff_registration',
+        source: fromStation ? 'care_station_kiosk' : 'staff_registration',
+        ...(fromStation ? { createdByStationId: (req.user as any).stationId, phoneUnverified: true } : {}),
         status: 'waiting_vitals',
         is_sandbox: req.isSandbox || false,
         createdAt: new Date(),
@@ -723,7 +1092,7 @@ router.post('/walk-ins', authenticate, authorize(...WALK_IN_STAFF_ROLES), requir
 // C1: authenticated facility staff only; the session must belong to the
 // caller's facility (vitals now feed deterministic triage floors).
 // LICENSURE WALL: recording vitals is a clinical act on a patient record.
-router.post('/walk-ins/:sessionId/vitals', authenticate, authorize(...WALK_IN_STAFF_ROLES), requireCompletedCredential(), intakeLimiter,
+router.post('/walk-ins/:sessionId/vitals', allowCareStationStaff, authenticate, authorize(...WALK_IN_STAFF_ROLES), requireCompletedCredential(), intakeLimiter,
     asyncHandler(async (req: AuthRequest, res: Response) => {
     const { sessionId } = req.params;
     const { bp, temp, hr, spo2, weight, pointOfCareTests } = req.body;
@@ -778,7 +1147,7 @@ router.post('/walk-ins/:sessionId/vitals', authenticate, authorize(...WALK_IN_ST
 // C1: authenticated facility staff only; session must belong to the facility.
 // LICENSURE WALL: pushing a walk-in to the doctor queue connects a patient to
 // care under this clinician's name.
-router.post('/walk-ins/:sessionId/send', authenticate, authorize(...WALK_IN_STAFF_ROLES), requireCompletedCredential(), intakeLimiter,
+router.post('/walk-ins/:sessionId/send', allowCareStationStaff, authenticate, authorize(...WALK_IN_STAFF_ROLES), requireCompletedCredential(), intakeLimiter,
     asyncHandler(async (req: AuthRequest, res: Response) => {
     const { sessionId } = req.params;
 
@@ -836,7 +1205,7 @@ router.post('/walk-ins/:sessionId/send', authenticate, authorize(...WALK_IN_STAF
         scheduledAt: new Date(),
         createdAt: new Date(),
         updatedAt: new Date(),
-        facilityId: sessionData.facilityId || null,
+        facilityId: centralRecordFacilityId(sessionData.facilityId || null),
         facilityName: sessionData.facilityName || null,
         symptoms: sessionData.chiefComplaint ? [sessionData.chiefComplaint] : ['Walk-in Intake Done'],
         chiefComplaint: sessionData.chiefComplaint || null,
@@ -919,7 +1288,7 @@ router.post('/walk-ins/:sessionId/send', authenticate, authorize(...WALK_IN_STAF
                 patientId: sessionData.patientId || null,
                 is_sandbox: req.isSandbox || false,
                 patientName: transportSafeSessionName(sessionData) || 'Walk-in Patient',
-                facilityId: null, // platform-wide queue → platform doctors pick up
+                facilityId: centralRecordFacilityId(null), // platform-wide queue → Central's doctors pick up
                 sourceFacilityId: sessionData.facilityId || null,
                 routedVia: 'platform_coverage',
                 platformCoverageBookingId: activeCoverage.bookingId,
@@ -981,6 +1350,23 @@ router.post('/walk-ins/:sessionId/send', authenticate, authorize(...WALK_IN_STAF
 
 // POST /ai-intake/walk-ins/claim-handoff — Claim a Care Station QR / 6-digit handoff code
 // Supports both authenticated patients and guests presenting a valid handoffToken or handoffCode.
+const HANDOFF_CODE_FAILURES_PER_HOUR = 60;
+
+async function handoffCodeAttemptsExhausted(): Promise<boolean> {
+    const hour = new Date().toISOString().slice(0, 13);
+    const snap = await firestore.collection('handoffCodeFailures').doc(hour).get();
+    return (Number(snap.data()?.count) || 0) >= HANDOFF_CODE_FAILURES_PER_HOUR;
+}
+
+async function recordHandoffCodeFailure(): Promise<void> {
+    const hour = new Date().toISOString().slice(0, 13);
+    const ref = firestore.collection('handoffCodeFailures').doc(hour);
+    await firestore.runTransaction(async (tx: any) => {
+        const count = (Number((await tx.get(ref)).data()?.count) || 0) + 1;
+        tx.set(ref, { count, hour }, { merge: true });
+    }).catch(() => undefined);
+}
+
 router.post('/walk-ins/claim-handoff',
     (req: AuthRequest, res: Response, next: any) => {
         const hasAuth = Boolean(req.headers?.authorization || (req as any).cookies?.token || (req as any).cookies?.accessToken);
@@ -990,8 +1376,23 @@ router.post('/walk-ins/claim-handoff',
         return next();
     },
     asyncHandler(async (req: AuthRequest, res: Response) => {
-        const { sessionId, consultationId, handoffToken, handoffCode, phone } = req.body || {};
+        const { sessionId, consultationId, handoffToken, phone } = req.body || {};
+        // Web and the apps send the typed code as `code`.
+        const handoffCode = req.body?.handoffCode ?? req.body?.code;
         const targetId = sessionId || consultationId || null;
+        const usingTypedCode = !handoffToken && !!handoffCode;
+
+        // A typed 6-digit code is short: cap failed code attempts platform-wide
+        // so nobody can walk the code space. The QR link (long token) and a
+        // signed-in patient are unaffected by the cap.
+        if (usingTypedCode && !req.user && await handoffCodeAttemptsExhausted()) {
+            res.status(429).json({
+                success: false,
+                error: 'Too many attempts. Scan the QR code on the Care Station screen, or sign in and try again.',
+                code: 'HANDOFF_CODE_LOCKED',
+            });
+            return;
+        }
 
         if (!handoffToken && !handoffCode) {
             res.status(400).json({
@@ -1018,6 +1419,7 @@ router.post('/walk-ins/claim-handoff',
         }
 
         if (!sessionDoc || !sessionDoc.exists) {
+            if (usingTypedCode) await recordHandoffCodeFailure();
             res.status(404).json({ success: false, error: 'Walk-in intake session not found.' });
             return;
         }
@@ -1028,6 +1430,7 @@ router.post('/walk-ins/claim-handoff',
         const tokenMatches = handoffToken && sessionData.handoffToken === String(handoffToken);
         const codeMatches = handoffCode && String(sessionData.handoffCode) === String(handoffCode).trim();
         if (!tokenMatches && !codeMatches) {
+            if (usingTypedCode) await recordHandoffCodeFailure();
             res.status(403).json({
                 success: false,
                 error: 'Invalid handoff token or code.',
@@ -1046,12 +1449,29 @@ router.post('/walk-ins/claim-handoff',
             return;
         }
 
-        let resolvedPatientId: string | null =
-            (req.user?.role === 'patient' ? req.user.userId : null)
-            || sessionData.patientId
-            || null;
+        // A session already linked to a patient is never re-linked to someone else.
+        const claimingPatientId = req.user?.role === 'patient' ? req.user.userId : null;
+        if (sessionData.patientId && claimingPatientId && sessionData.patientId !== claimingPatientId) {
+            res.status(409).json({ success: false, error: 'This visit belongs to another account.', code: 'HANDOFF_OTHER_ACCOUNT' });
+            return;
+        }
+        let resolvedPatientId: string | null = sessionData.patientId || claimingPatientId || null;
 
-        if (!resolvedPatientId && phone) {
+        // Linking by a typed phone number only for staff of this facility, who
+        // can check the patient in person. Anyone else's typed number is kept
+        // as unverified and never links an account.
+        const staffOfFacility = !!req.user
+            && WALK_IN_STAFF_ROLES.includes(req.user.role as any)
+            && !!req.user.facilityId
+            && req.user.facilityId === sessionData.facilityId;
+        if (!resolvedPatientId && phone && !staffOfFacility) {
+            await collections.intakeSessions.doc(resolvedSessionId).set({
+                claimPhone: String(phone).slice(0, 32),
+                claimPhoneUnverified: true,
+            }, { merge: true });
+        }
+
+        if (!resolvedPatientId && phone && staffOfFacility) {
             const lookupResult = await lookupOrCreatePatientForCareStation({
                 phone: String(phone),
                 fullName: transportSafeSessionName(sessionData) || 'Walk-in Patient',
@@ -1104,7 +1524,7 @@ router.post('/walk-ins/claim-handoff',
 );
 
 // POST /ai-intake/walk-ins/:sessionId/chat — Staff-assisted AI Intake Bot conversation on behalf of a walk-in patient
-router.post('/walk-ins/:sessionId/chat', authenticate, authorize(...WALK_IN_STAFF_ROLES),
+router.post('/walk-ins/:sessionId/chat', allowCareStation, authenticate, authorize(...WALK_IN_STAFF_ROLES, STATION_DEVICE),
     asyncHandler(async (req: AuthRequest, res: Response) => {
         const { sessionId } = req.params;
         const { message, language } = req.body || {};
@@ -1122,6 +1542,10 @@ router.post('/walk-ins/:sessionId/chat', authenticate, authorize(...WALK_IN_STAF
 
         const sessionData = sessionDoc.data() || {};
         const sessionFacilityId = sessionData.facilityId || null;
+        if (!stationMaySeeSession(req.user, sessionData)) {
+            res.status(404).json({ success: false, error: 'Intake session not found' });
+            return;
+        }
         if (!(req.user!.facilityId && req.user!.facilityId === sessionFacilityId)
             && !platformCanSeeFacility(req.user!, sessionFacilityId)) {
             res.status(403).json({ success: false, error: 'This walk-in belongs to another facility.' });
@@ -1148,7 +1572,7 @@ router.post('/walk-ins/:sessionId/chat', authenticate, authorize(...WALK_IN_STAF
 );
 
 // POST /ai-intake/walk-ins/:sessionId/handoff-token — Generate short-lived QR / 6-digit handoff token for patient's phone
-router.post('/walk-ins/:sessionId/handoff-token', authenticate, authorize(...WALK_IN_STAFF_ROLES),
+router.post('/walk-ins/:sessionId/handoff-token', allowCareStation, authenticate, authorize(...WALK_IN_STAFF_ROLES, STATION_DEVICE),
     asyncHandler(async (req: AuthRequest, res: Response) => {
         const { sessionId } = req.params;
         const sessionDoc = await collections.intakeSessions.doc(sessionId).get();
@@ -1159,6 +1583,10 @@ router.post('/walk-ins/:sessionId/handoff-token', authenticate, authorize(...WAL
 
         const sessionData = sessionDoc.data() || {};
         const sessionFacilityId = sessionData.facilityId || null;
+        if (!stationMaySeeSession(req.user, sessionData)) {
+            res.status(404).json({ success: false, error: 'Intake session not found' });
+            return;
+        }
         if (!(req.user!.facilityId && req.user!.facilityId === sessionFacilityId)
             && !platformCanSeeFacility(req.user!, sessionFacilityId)) {
             res.status(403).json({ success: false, error: 'This walk-in belongs to another facility.' });
@@ -1205,7 +1633,7 @@ router.post('/walk-ins/:sessionId/handoff-token', authenticate, authorize(...WAL
 );
 
 // GET /ai-intake/care-station/:consultationId/terminal — Live Care Station terminal state for patient or assisting staff
-router.get('/care-station/:consultationId/terminal', authenticate,
+router.get('/care-station/:consultationId/terminal', allowCareStation, authenticate,
     asyncHandler(async (req: AuthRequest, res: Response) => {
         const { consultationId } = req.params;
         const user = req.user!;
@@ -1232,7 +1660,8 @@ router.get('/care-station/:consultationId/terminal', authenticate,
         const isOwnerPatient = user.role === 'patient' && patientId && patientId === user.userId;
         const isAssignedDoctor = user.role === 'doctor' && consultData.doctorId === user.userId;
         const isSameFacilityStaff =
-            WALK_IN_STAFF_ROLES.includes(user.role as any)
+            (WALK_IN_STAFF_ROLES.includes(user.role as any)
+                || (user.role === STATION_DEVICE && stationMaySeeSession(user, sessionData)))
             && Boolean(user.facilityId && facilityId && user.facilityId === facilityId);
         const isPlatform = isPlatformAdmin(user);
 
@@ -1292,7 +1721,7 @@ router.get('/care-station/:consultationId/terminal', authenticate,
 );
 
 // POST /ai-intake/care-station/:consultationId/terminal-message — Send message from Care Station terminal (patient_terminal or staff_assisted)
-router.post('/care-station/:consultationId/terminal-message', authenticate,
+router.post('/care-station/:consultationId/terminal-message', allowCareStation, authenticate,
     asyncHandler(async (req: AuthRequest, res: Response) => {
         const { consultationId } = req.params;
         const { content, message, senderMode, senderName } = req.body || {};
@@ -1322,7 +1751,8 @@ router.post('/care-station/:consultationId/terminal-message', authenticate,
         const isOwnerPatient = user.role === 'patient' && patientId && patientId === user.userId;
         const isAssignedDoctor = user.role === 'doctor' && consultData.doctorId === user.userId;
         const isSameFacilityStaff =
-            WALK_IN_STAFF_ROLES.includes(user.role as any)
+            (WALK_IN_STAFF_ROLES.includes(user.role as any)
+                || (user.role === STATION_DEVICE && stationMaySeeSession(user, sessionData)))
             && Boolean(user.facilityId && facilityId && user.facilityId === facilityId);
         const isPlatform = isPlatformAdmin(user);
 
@@ -1332,18 +1762,18 @@ router.post('/care-station/:consultationId/terminal-message', authenticate,
         }
 
         const resolvedMode: 'patient_terminal' | 'staff_assisted' =
-            senderMode === 'patient_terminal' || user.role === 'patient'
+            senderMode === 'patient_terminal' || user.role === 'patient' || user.role === STATION_DEVICE
                 ? 'patient_terminal'
                 : 'staff_assisted';
 
         const messageId = uuidv4();
         const now = new Date();
-        const resolvedSenderName =
-            typeof senderName === 'string' && senderName.trim()
-                ? senderName.trim()
-                : resolvedMode === 'patient_terminal'
-                    ? (consultData.patientName || sessionData.firstName || 'Walk-in Patient')
-                    : `Care Station (${user.role})`;
+        // The sender's name always comes from the record, never the client, so
+        // nobody can post into the doctor's chat as someone else.
+        void senderName;
+        const resolvedSenderName = resolvedMode === 'patient_terminal'
+            ? (consultData.patientName || sessionData.firstName || 'Walk-in Patient')
+            : `Care Station (${user.role})`;
 
         const msgPayload = {
             id: messageId,
@@ -1377,15 +1807,15 @@ router.get('/:consultationId/brief', authenticate, authorize('doctor', 'admin', 
         const ctx = await loadConsultationContext(consultationId);
         let allowed = Boolean(ctx && canViewPhysicianBrief(req.user!, ctx));
         if (!allowed && ctx && !ctx.doctorId && ctx.status !== 'completed' && ctx.status !== 'cancelled' && req.user?.role === 'doctor') {
+            // Unclaimed item: the SAME scope predicate as the claim gate decides
+            // whether this doctor may read the brief before claiming.
             try {
-                const dSnap = await collections.doctors.doc(req.user.userId).get();
-                const dData = dSnap.exists ? dSnap.data() : null;
-                if (dData && (dData.doctorType === 'both' || dData.doctorType === 'platform' || dData.platformTelehealthAgreement === true)) {
-                    const allowedFacs = [req.user.facilityId, dData.facilityId, ...(Array.isArray(dData.allowedFacilityIds) ? dData.allowedFacilityIds : [])].filter(Boolean);
-                    if (!ctx.facilityId || ctx.facilityId === 'DOCARION_PLATFORM' || allowedFacs.includes(ctx.facilityId)) {
-                        allowed = true;
-                    }
-                }
+                const scope = await resolveDoctorScope(req.user);
+                const fid = partnerSiteIdOf(ctx.facilityId);
+                allowed = canViewPhysicianBrief(req.user, {
+                    ...ctx,
+                    facilityUsesPlatformDoctors: fid ? await facilityUsesPlatformDoctorsAt(fid).catch(() => false) : false,
+                }, scope);
             } catch { /* fallback to allowed=false */ }
         }
         if (!ctx || !allowed) {
@@ -1393,25 +1823,29 @@ router.get('/:consultationId/brief', authenticate, authorize('doctor', 'admin', 
             return;
         }
 
-        const result = await getPhysicianBrief(consultationId);
+        const result = await getPhysicianBrief(consultationId, { regenerateIfMissing: true });
 
-        let fallbackBrief: any = null;
-        if (!result.brief) {
-            const cDoc = await collections.consultations.doc(consultationId).get();
-            if (cDoc.exists && cDoc.data()?.physicianBrief) {
-                fallbackBrief = cDoc.data()?.physicianBrief;
-            }
-        }
-
-        const resolvedBrief = result.brief || fallbackBrief;
-
-        if (!resolvedBrief) {
-            res.status(404).json({
-                success: false,
-                error: 'Physician brief not yet generated. Intake may still be in progress.',
+        if (result.status === 'generating') {
+            res.status(202).json({
+                success: true,
+                status: 'generating',
+                data: { brief: null, transcript: result.transcript, retryAfterSeconds: 5 },
             });
             return;
         }
+
+        if (!result.brief) {
+            res.status(404).json({
+                success: false,
+                code: result.error ? 'BRIEF_GENERATION_FAILED' : 'BRIEF_NOT_READY',
+                error: result.error
+                    ? 'The physician brief could not be generated for this intake. The transcript is still available.'
+                    : 'Physician brief not yet generated. Intake may still be in progress.',
+                data: { transcript: result.transcript },
+            });
+            return;
+        }
+        const resolvedBrief = result.brief;
 
         // Integrity + provenance context for the doctor: liveness/bot signals
         // from the intake session, consent stamp, and the latest visit vitals
@@ -1442,6 +1876,9 @@ router.get('/:consultationId/brief', authenticate, authorize('doctor', 'admin', 
             success: true,
             data: {
                 brief: resolvedBrief,
+                safety: result.safety,
+                briefRaw: result.briefRaw,
+                generatedAt: result.generatedAt,
                 transcript: result.transcript,
                 integrity,
                 consentForCare,
@@ -1559,7 +1996,7 @@ function normalizeStringList(val: unknown): string[] {
  * Records Nurse Hx Intake on the consultation and generates/updates the structured
  * clinical brief so the doctor has the full pre-consultation Hx summary.
  */
-router.post('/:consultationId/nurse-complete', authenticate, authorize(...NURSE_HX_INTAKE_ROLES),
+router.post('/:consultationId/nurse-complete', allowCareStationStaff, authenticate, authorize(...NURSE_HX_INTAKE_ROLES),
     asyncHandler(async (req: AuthRequest, res: Response) => {
         const { consultationId } = req.params;
         const {
@@ -1597,7 +2034,7 @@ router.post('/:consultationId/nurse-complete', authenticate, authorize(...NURSE_
         const consultData = consultDoc.exists ? consultDoc.data() : null;
 
         // Enforce facility scoping when consultation is bound to a specific facility
-        if (consultData?.facilityId && req.user!.facilityId && consultData.facilityId !== req.user!.facilityId && !isPlatformAdmin(req.user!)) {
+        if (partnerSiteIdOf(consultData?.facilityId) && req.user!.facilityId && consultData?.facilityId !== req.user!.facilityId && !isPlatformAdmin(req.user!)) {
             res.status(403).json({
                 success: false,
                 error: 'You are not authorized to complete intake for another facility.',
@@ -1916,23 +2353,49 @@ router.post(
 // 3. Two-Way Doctor-Patient Call Voice Segregation (Diarization + MMS ASR)
 router.post(
     ['/call-diarize', '/:consultationId/call-diarize'],
+    // Call audio and transcripts are patient data: signed-in staff only.
+    authenticate,
     asyncHandler(async (req: Request, res: Response) => {
+        if ((req as AuthRequest).user?.role === 'patient') {
+            res.status(403).json({ success: false, error: 'Not allowed' });
+            return;
+        }
         const { audioBase64, dialogue, customDialogue, customTranscript, language, stripNoise } = req.body;
-        const result = await callVoiceDiarizationService.diarizeConsultationAudio({
-            audioBase64,
-            dialogue: dialogue || customDialogue || customTranscript,
-            consultationId: req.params.consultationId,
-            language,
-            stripNoise,
-        });
-        res.json({ success: true, data: result });
+        try {
+            const result = await callVoiceDiarizationService.diarizeConsultationAudio({
+                audioBase64,
+                dialogue: dialogue || customDialogue || customTranscript,
+                consultationId: req.params.consultationId,
+                language,
+                stripNoise,
+            });
+            res.json({ success: true, data: result });
+        } catch (err) {
+            if (err instanceof DiarizationUnavailableError) {
+                res.status(503).json({ success: false, error: err.message, code: err.code });
+                return;
+            }
+            throw err;
+        }
     })
 );
 
 // 4. Live Serverless DDx & Automated SOAP Co-Pilot (Muse Wonder)
+// Clinician decision support only: same access as the physician brief
+// (patients and unrelated staff are refused; the patient-facing kiosk never calls it).
 router.post(
     '/:consultationId/copilot-sync',
-    asyncHandler(async (req: Request, res: Response) => {
+    authenticate,
+    asyncHandler(async (req: AuthRequest, res: Response) => {
+        const ctx = await loadConsultationContext(req.params.consultationId);
+        if (!ctx) {
+            res.status(404).json({ success: false, error: 'Consultation or intake session not found' });
+            return;
+        }
+        if (!canViewPhysicianBrief(req.user!, ctx)) {
+            res.status(403).json({ success: false, error: 'The clinical co-pilot is available to the treating care team only.' });
+            return;
+        }
         const { transcript, intakeHistory, vitals, visionFindings, language } = req.body;
         const result = await aiCopilotService.generateLiveConsultationCopilot({
             consultationId: req.params.consultationId,
