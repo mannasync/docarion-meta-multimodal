@@ -7,6 +7,16 @@
 
 ---
 
+## 👨‍⚕️ Founding Team & Clinical Leadership (`Team #468 — Docarion`)
+
+- **Dr. Godswill Olemgbe, MBBS** — Founder & CEO ([@evidencechecked](https://x.com/evidencechecked))
+- **Dr. Ayotomiwa Ayilola, MBBS** — Co-Founder & CMO ([@silverpenydr](https://x.com/silverpenydr))
+- **Yusuf Alani Olayode** — Co-Founder & CTO ([@Doctware](https://x.com/Doctware))
+- **C. Kunnuji** — Founding Engineering & Operations ([@KunnujiC](https://x.com/KunnujiC))
+- **Official Brand & Pilot/Angel Partner Inquiries:** [@docarion_hq](https://x.com/docarion_hq) · [https://docarion.com](https://docarion.com)
+
+---
+
 ## ⚡ What Was Newly Built During This Hackathon (Startup Track Rule 4 Disclosure)
 
 While Docarion provides the underlying multi-facility EMR foundation, **100% of the Meta AI clinical intelligence, history-taking, diagnosis support, and multi-role care-line support systems** in this repository and demonstrated in our walkthrough video were built from scratch during the hackathon across **three core pillars**:
