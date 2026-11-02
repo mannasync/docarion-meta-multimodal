@@ -1,9 +1,35 @@
-# Docarion — Cerebral Valley × Meta Global AI Developer Hackathon Submission Package
+# Docarion — Meta Multimodal Clinical Intelligence & Support Engine
+> **Cerebral Valley × Meta Global AI Developer Hackathon (Startups Track — Team #468)**
+> - **Live Production Platform:** [https://docarion.com](https://docarion.com) ([Login](https://docarion.com/auth/login))
+> - **Dedicated Judge Login:** `judge@docarion.clinic` | **Password:** `Password123!`
+> - **Pre-Seeded Judge Consultation Room:** [https://docarion.com/consultations/consult-meta-judge-demo](https://docarion.com/consultations/consult-meta-judge-demo)
+> - **3-Minute Judge Walkthrough Video:** [https://www.youtube.com/watch?v=-dXTo4Eb28M](https://www.youtube.com/watch?v=-dXTo4Eb28M)
 
-> **Status:** 100% Built, Deployed, Verified Across All 10 Roles (Web + iOS + Android), and Mapped Word-for-Word to the Live Cerebral Valley Submission Form.
-> **Canonical Production URL:** [https://docarion.com](https://docarion.com)
-> **Live Submission Page Inspected:** `https://cerebralvalley.ai/e/meta-ai-developer-hackathon/hackathon/submit`
-> **Live Participant Rules Inspected:** `https://cerebralvalley.ai/e/meta-ai-developer-hackathon/details`
+---
+
+## ⚡ What Was Newly Built During This Hackathon (Startup Track Rule 4 Disclosure)
+
+While Docarion provides the underlying multi-facility EMR foundation, **100% of the Meta AI clinical intelligence, history-taking, diagnosis support, and multi-role care-line support systems** in this repository and demonstrated in our walkthrough video were built from scratch during the hackathon across **three core pillars**:
+
+### 1. Adaptive AI History-Taking & Longitudinal Fixed-History Engine (`Meta Muse Spark` + `Meta SAM 3.1`)
+- **Concise 3-Turn Adaptive Symptom Intake (`backend/src/services/ai-intake.service.ts`, `intake-history.service.ts`):** Plain-language conversational history-taking across English, Nigerian Pidgin (`pcm`), Hausa, Yoruba, and Igbo that adapts to patient literacy while enforcing a strict zero-leak boundary (differential diagnoses never leak into patient chat).
+- **Once-Only Longitudinal Fixed History Editor (`frontend/src/components/patient/FixedHistoryEditor.tsx`):** Permanently stores static history domains (`allergies`, `medications`, `pastMedical`, `pastSurgical`, `familyHistory`, `socialHistory`) so returning patients are never re-asked baseline questions.
+- **2-Hour Incomplete Session Resumption & Two-Phase Doctor Notifications:** Automatically resumes incomplete check-ins within 2 hours and dispatches two-phase alerts (`history_started` → `ready_to_claim`) to on-duty doctors.
+- **Multimodal Intake & Care-Station Scanning (`Meta SAM 3.1` on Modal T4 GPU):** Zero-shot pixel segmentation for Malaria RDT strips (`rdt_strip`), calibrated wound planimetry (`wound`, cm²), pre-OCR paper lab header redaction (`lab_sheet`), and NAFDAC drug packaging verification (`drug_pack`).
+
+### 2. Clinical Diagnosis, Differential (`DDx`) & Auto-SOAP Decision Support System (`Meta Muse Wonder`)
+- **Pre-Claim Physician Brief (`PhysicianBrief.tsx`):** Synthesizes a 15-second clinical brief (HPI, red flags, vitals, allergies, and SAM 3.1 findings) directly on the telehealth queue row before a doctor claims the visit.
+- **Live In-Chat Clinical Co-Pilot (`[data-testid="live-chat-ai-copilot-card"]`):** Continuously reads preliminary AI history, nurse vitals, and live doctor-patient conversation to generate:
+  1. **Ranked ICD-10 Differential Diagnoses (`DDx`)** with 1-click adoption into the chart (`+ Adopt DDx into SOAP`).
+  2. **On-the-Spot Chat Guidance & Red-Flag Prompts** with 1-click insertion into chat (`💬 Ask in Chat`).
+  3. **NAFDAC-Verified Treatment Suggestions & WHO AWaRe Antibiotic Stewardship Alerts** with 1-click plan adoption.
+  4. **Grounded 4-Part Auto-SOAP Note Synthesis (`S`, `O`, `A`, `P`)** with live refresh and save.
+- **Flexible e-Prescription Dosing Engine:** Supports `fixed`, `variable`, `tapering`, `prn`, and `range` regimens with automated quantity calculation.
+
+### 3. Multi-Role Care-Line Support, Talk-Through AI Assistant & Call Diarization (`Meta MMS-1B` + `Muse Spark`)
+- **Stage-Scoped Care-Line Conversation Tunnel (`ConsultationChat.tsx`):** Least-privilege episode channels (`clinical`, `nurse`, `pharmacy`, `delivery`) with open/pause/close controls and seamless in-call Audio/Video/Chat modality switching.
+- **Floating Talk-Through AI Support Assistant (`AICopilotFloatingPill.tsx`, `DashboardAIAssistant.tsx`):** Context-aware lower-right AI assistant deployed across all 9 facility dashboards (Care Homes, Clinics, Hospitals, Pharmacies, PPMVs, Diagnostic Labs, Radiology Centers, and Customer Care / Phone Desk) plus staff-assisted phone-line visit scheduling.
+- **2-Way Call Audio Diarization & Multilingual ASR (`Meta MMS-1B` + `Pyannote 3.1` on Modal GPU):** Separates `SPEAKER_DOCTOR` and `SPEAKER_PATIENT` audio across English, Nigerian Pidgin, Hausa, Yoruba, and Igbo directly into the consultation EHR.
 
 ---
 

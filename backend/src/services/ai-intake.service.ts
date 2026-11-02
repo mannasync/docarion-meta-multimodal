@@ -24,9 +24,14 @@ import {
     computeCarryOverDeltas,
     classifyUrgencyFloor,
     resolveTriage,
+    unconfirmedCarriedDomains,
+    SAFETY_CARRY_DOMAINS,
 } from './intake-history.service';
 import { toMillis } from '../utils/timestamp';
 import { markQueueEntryIntakeComplete } from './queue-entry.service';
+import { notificationService } from './notification.service';
+import { resolveOnDutyDoctors, CENTRAL_SCOPE } from './on-duty-doctors.service';
+import { partnerSiteIdOf } from '../config/tenancy';
 import { GUEST_CALLBACK_ASK } from './emergency-copy';
 import { wrapUntrustedData } from '../utils/ai-safety';
 import { computeAgeFromDob } from '../utils/ai-pseudonymize';
@@ -129,12 +134,18 @@ This is a TEXT-BASED chat, NOT a video call or in-person visit. You MUST:
 - For location questions, ask: "Can you describe where exactly you feel it? For example, is it on the left side, right side, front, back, or all over?"
 - The doctor can convert to video call later if needed — do NOT mention video calls.
 
-COMMUNICATION STYLE (LOW-LITERACY FRIENDLY — ALWAYS ON):
-- Use plain, simple words a person with basic schooling understands (8th-grade level or below). Short sentences.
-- Ask EXACTLY ONE question at a time. Never bundle questions.
-- No medical jargon. If a medical word is unavoidable, explain it immediately in brackets (e.g., "hypertension (high blood pressure)").
-- Explain numbers and scales simply: "Out of 10, where 10 is the worst pain you have ever had and 1 is very small pain, what number is your pain?"
-- For time, offer anchors: "Did it start today, some days ago, or weeks ago?"
+COMMUNICATION STYLE (EVERYDAY BASIC UNDERSTANDING — NO HIGHFALUTIN WORDS — ALWAYS ON):
+- Speak at a basic primary-school level (Grade 4–5). Use short, warm, everyday words that anyone in a local clinic or village market immediately understands.
+- Keep your reply SHORT: at most 1–2 short sentences (under 25 words total).
+- Ask focused, concise questions tailored directly to the presenting complaint. Ask 1 clear question, or at most 2 closely linked questions (e.g. onset and severity together) to avoid unnecessary round-trips. Never repeat questions or re-ask information the patient has already provided.
+- FORBIDDEN HIGHFALUTIN / CLINICAL WORDS — NEVER use these words with a patient: "characteristics", "quality of pain", "aggravating", "exacerbating", "relieving", "alleviating", "precipitating", "radiating", "manifestations", "constitutional", "gastrointestinal", "dysuria", "photophobia", "episodes", "intermittent", "chronic", "acute", "prior surgical history", "review of systems", "comorbidities".
+- Always translate medical ideas into everyday words and give 2–3 simple examples:
+  * Instead of "What are the characteristics of the pain?", ask: "What does the pain feel like — for example, is it sharp, dull, burning, or tight?"
+  * Instead of "Are there any aggravating or relieving factors?", ask: "What makes it feel worse?" (and in the next turn: "What helps it feel better?")
+  * Instead of "Do you have any past medical or surgical history?", ask: "Do you have any long-term health problems like high blood pressure, sugar (diabetes), asthma, or ulcer?"
+- ADAPT TO THE PATIENT'S LANGUAGE LEVEL: Watch how the patient writes. If they write short, simple, informal, or broken-English replies, make your questions even simpler, shorter, and gentler.
+- Explain numbers simply: "From 1 to 10, where 1 is very small and 10 is the worst pain you have ever felt, what number is it?"
+- For time, offer simple choices: "Did it start today, a few days ago, or longer?"
 - Gently confirm you understood answers that are unclear, without making the patient feel tested.
 
 LANGUAGE MIRRORING:
@@ -207,6 +218,7 @@ RESPONSE FORMAT — Always respond with ONLY valid JSON:
     "mentalHealth": {"moodSleepAppetite": "...", "riskAssessment": "..."},
     "chronicFollowUp": {"medicationAdherence": "...", "symptomTrajectory": "...", "complicationsScreen": "..."},
     "explicitNegatives": ["denies fever", "no known drug allergies"],
+    "confirmations": {"medications": "unchanged|updated", "allergies": "unchanged|updated"},
     "contextFlags": {"isPediatric": false, "isObstetric": false, "isMentalHealth": false, "isChronicFollowUp": false, "detectedLanguage": "en"}
   }
 }
@@ -281,6 +293,39 @@ const LANGUAGE_ADDENDUMS: Record<string, string> = {
     fr: '\nThe patient communicates in French. Respond entirely in French with standard medical terminology.',
 };
 
+/**
+ * Inspects how the patient is writing (word count, informal/broken phrasing,
+ * everyday Nigerian expressions) and returns a dynamic instruction so the AI
+ * adjusts its question simplicity to match the patient's reading/speaking level.
+ */
+export function buildAdaptiveLanguageNote(
+    currentMessage: string,
+    historyMessages: ChatMessage[] = []
+): string {
+    const userTurns = [
+        ...historyMessages.filter((m) => m.role === 'user').map((m) => m.content || ''),
+        currentMessage || '',
+    ].filter((t) => t.trim().length > 0);
+
+    if (userTurns.length === 0) return '';
+
+    const recentUserText = userTurns.slice(-3).join(' ').trim();
+    const words = recentUserText.split(/\s+/).filter(Boolean);
+    const avgWordsPerTurn = words.length / Math.min(userTurns.length, 3);
+    const avgWordLen = words.length > 0
+        ? words.reduce((sum, w) => sum + w.replace(/[^a-zA-Z]/g, '').length, 0) / words.length
+        : 4;
+
+    const informalOrSimplePattern = /\b(dey|wetin|abeg|na\s+so|my\s+body|belly|belle|head\s+dey|pain\s+me|since\s+yesterday|small\s+small|no\s+too|i\s+no\s+fit|e\s+dey|dont\s+know|idk|nope|yeah|nah|ok|yes|no)\b/i;
+    const isVeryBriefOrInformal = avgWordsPerTurn <= 6 || avgWordLen <= 4.3 || informalOrSimplePattern.test(recentUserText);
+
+    if (isVeryBriefOrInformal) {
+        return `\n\nADAPTIVE PATIENT LITERACY NOTE: The patient is replying with short, basic, everyday phrases. Keep your next question ULTRA-SIMPLE (Grade 3–4 level, maximum 15–18 words), warm, and conversational. Give 2–3 easy everyday choices in your question (for example: "Is the pain sharp, dull, or burning?" or "Does it hurt more when you move or eat?") so they can answer easily in 1 or 2 words. NEVER use textbook words like "characteristics", "aggravating", "relieving", or "surgical history".`;
+    }
+
+    return `\n\nADAPTIVE PATIENT LITERACY NOTE: Keep your next question friendly, direct, and easy to understand (everyday conversational English, under 22 words). Avoid clinical terms like "characteristics", "aggravating", "relieving", or "review of systems" — ask in plain everyday words ("What does it feel like?", "What makes it worse?", "What makes it better?").`;
+}
+
 // ============================================================
 // Llama API Call (shared pattern)
 // Uses native fetch() instead of axios because Node.js 20's
@@ -326,25 +371,141 @@ interface IntakeSession {
  * Requires a consultation doc with a patientId — the anonymous walk-in/guest
  * flow has none, so it is skipped automatically there.
  */
-async function findPriorHistoryForPatient(
+export async function findPriorHistoryForPatient(
     patientId: string,
-    excludeConsultationId: string
+    excludeConsultationId?: string
 ): Promise<{ historyState: HistoryState; sourceConsultationId: string; completedAtMs: number } | null> {
     const snap = await collections.intakeSessions
         .where('patientId', '==', patientId)
-        .where('isComplete', '==', true)
         .get();
 
-    let best: { historyState: HistoryState; sourceConsultationId: string; completedAtMs: number } | null = null;
+    let bestCompleted: { historyState: HistoryState; sourceConsultationId: string; completedAtMs: number } | null = null;
+    let bestPartial: { historyState: HistoryState; sourceConsultationId: string; completedAtMs: number } | null = null;
+
     for (const doc of snap.docs) {
         if (doc.id === excludeConsultationId) continue;
         const data = doc.data();
         if (!data?.historyState) continue;
+        const hs = data.historyState as HistoryState;
+        const hasCarryableField = Boolean(
+            hs.pastMedical || hs.pastSurgical || hs.familyHistory || hs.socialHistory ||
+            hs.medications || hs.allergies || hs.obstetric?.gravidaPara
+        );
+        if (!hasCarryableField) continue;
         const completedAtMs = toMillis(data.completedAt || data.updatedAt || data.createdAt);
-        if (!best || completedAtMs > best.completedAtMs) {
-            best = { historyState: data.historyState, sourceConsultationId: doc.id, completedAtMs };
+        if (data.isComplete === true) {
+            if (!bestCompleted || completedAtMs > bestCompleted.completedAtMs) {
+                bestCompleted = { historyState: hs, sourceConsultationId: doc.id, completedAtMs };
+            }
+        } else {
+            if (!bestPartial || completedAtMs > bestPartial.completedAtMs) {
+                bestPartial = { historyState: hs, sourceConsultationId: doc.id, completedAtMs };
+            }
         }
     }
+
+    let best = bestCompleted || bestPartial;
+
+    // Also enrich from patient profile longitudinal record (so static history taken once is never lost)
+    try {
+        const patientDoc = await collections.patients.doc(patientId).get();
+        if (patientDoc.exists) {
+            const pData = patientDoc.data() || {};
+            const lh = pData.longitudinalHistory || {};
+            const profileState = best ? { ...best.historyState, obstetric: { ...(best.historyState.obstetric || { lmp: null, gravidaPara: null, gestationalAge: null, bleedingPainFetalMovement: null, dangerSigns: null }) } } : createEmptyHistoryState();
+            let enriched = false;
+
+            const formatHistoryVal = (val: unknown): string | null => {
+                if (!val) return null;
+                if (typeof val === 'string') {
+                    const trimmed = val.trim();
+                    return trimmed.length > 0 ? trimmed : null;
+                }
+                if (Array.isArray(val) && val.length > 0) {
+                    const parts = val
+                        .filter(v => typeof v === 'string' && v.trim().length > 0)
+                        .map(v => (v as string).trim());
+                    return parts.length > 0 ? parts.join(', ') : null;
+                }
+                if (typeof val === 'object' && val !== null) {
+                    const obj = val as Record<string, unknown>;
+                    if (typeof obj.notes === 'string' && obj.notes.trim()) {
+                        return obj.notes.trim();
+                    }
+                    const textParts = Object.entries(obj)
+                        .map(([k, v]) => {
+                            if (typeof v === 'string' && v.trim()) return `${k}: ${v.trim()}`;
+                            if (typeof v === 'object' && v !== null) return `${k}: ${JSON.stringify(v)}`;
+                            return v !== null && v !== undefined ? `${k}: ${v}` : '';
+                        })
+                        .filter(Boolean);
+                    return textParts.length > 0 ? textParts.join('; ') : null;
+                }
+                const str = String(val).trim();
+                return str.length > 0 ? str : null;
+            };
+
+            const applyHistoryField = (field: keyof HistoryState, val: unknown) => {
+                const formatted = formatHistoryVal(val);
+                if (formatted) {
+                    if ((profileState as any)[field] !== formatted) {
+                        (profileState as any)[field] = formatted;
+                        enriched = true;
+                    }
+                }
+            };
+
+            const mr = pData.medicalRecord || {};
+            applyHistoryField('pastMedical', lh.pastMedical || mr.conditions || mr.pastMedical || pData.pastConditions || pData.chronicConditions || pData.medicalHistory?.conditions);
+            applyHistoryField('pastSurgical', lh.pastSurgical || mr.surgeries || mr.pastSurgical || pData.pastSurgical || pData.medicalHistory?.surgeries);
+            applyHistoryField('familyHistory', lh.familyHistory || mr.familyHistory || pData.familyHistory || pData.medicalHistory?.familyHistory);
+            applyHistoryField('socialHistory', lh.socialHistory || mr.socialHistory || pData.socialHistory || pData.medicalHistory?.socialHistory);
+            applyHistoryField('medications', lh.medications || mr.medications || pData.knownMedications || pData.currentMedications);
+            applyHistoryField('allergies', lh.allergies || mr.allergies || pData.knownAllergies || pData.allergies);
+
+            const gravidaPara = formatHistoryVal(lh.gravidaPara || mr.gravidaPara || pData.gravidaPara || pData.obstetric?.gravidaPara);
+            if (gravidaPara) {
+                if (!profileState.obstetric) {
+                    profileState.obstetric = { lmp: null, gravidaPara: null, gestationalAge: null, bleedingPainFetalMovement: null, dangerSigns: null };
+                }
+                if (profileState.obstetric.gravidaPara !== gravidaPara) {
+                    profileState.obstetric.gravidaPara = gravidaPara;
+                    enriched = true;
+                }
+            }
+
+            const lhUpdatedAtMs = toMillis(
+                lh.updatedAt ||
+                pData.medicalHistoryUpdatedAt ||
+                mr.updatedAt ||
+                pData.updatedAt ||
+                pData.createdAt
+            ) || 0;
+
+            if (best) {
+                const effectiveCompletedAtMs = (lhUpdatedAtMs > (best.completedAtMs || 0))
+                    ? lhUpdatedAtMs
+                    : best.completedAtMs;
+
+                if (enriched || lhUpdatedAtMs > (best.completedAtMs || 0)) {
+                    best = {
+                        ...best,
+                        historyState: profileState,
+                        completedAtMs: effectiveCompletedAtMs,
+                    };
+                }
+            } else if (enriched || lhUpdatedAtMs > 0) {
+                best = {
+                    historyState: profileState,
+                    sourceConsultationId: `patient-profile-${patientId}`,
+                    completedAtMs: lhUpdatedAtMs || Date.now(),
+                };
+            }
+        }
+    } catch (err) {
+        log.warn('Failed to read patient longitudinal profile for history seeding:', err);
+    }
+
     return best;
 }
 
@@ -503,7 +664,8 @@ async function saveIntakeSession(
     historyState?: HistoryState,
     redFlags?: RedFlagHit[],
     emergencyDetected?: boolean,
-    triage?: TriageDisposition | null
+    triage?: TriageDisposition | null,
+    patientId?: string | null
 ): Promise<void> {
     const trimmed = messages.slice(-50); // Keep more history than symptom checker
     const update: any = {
@@ -518,6 +680,31 @@ async function saveIntakeSession(
     if (triage !== undefined) update.triage = triage;
     if (isComplete) update.completedAt = new Date(); // carry-over recency anchor
     await collections.intakeSessions.doc(consultationId).update(update);
+
+    // Best-effort persist once-only static longitudinal history onto patient profile
+    if (patientId && historyState) {
+        const lhUpdate: Record<string, any> = {};
+        if (historyState.pastMedical) lhUpdate.pastMedical = historyState.pastMedical;
+        if (historyState.pastSurgical) lhUpdate.pastSurgical = historyState.pastSurgical;
+        if (historyState.familyHistory) lhUpdate.familyHistory = historyState.familyHistory;
+        if (historyState.socialHistory) lhUpdate.socialHistory = historyState.socialHistory;
+        if (historyState.medications) lhUpdate.medications = historyState.medications;
+        if (historyState.allergies) lhUpdate.allergies = historyState.allergies;
+        if (historyState.obstetric?.gravidaPara) lhUpdate.gravidaPara = historyState.obstetric.gravidaPara;
+
+        if (Object.keys(lhUpdate).length > 0) {
+            lhUpdate.updatedAt = new Date().toISOString();
+            lhUpdate.lastSourceConsultationId = consultationId;
+            try {
+                await collections.patients.doc(patientId).set(
+                    { longitudinalHistory: lhUpdate },
+                    { merge: true }
+                );
+            } catch (err) {
+                log.warn('Failed to persist longitudinal history onto patient profile (non-fatal):', err);
+            }
+        }
+    }
 }
 
 /** Merge new red-flag hits into a session list, deduped by id+severity. */
@@ -798,34 +985,63 @@ export async function conductIntake(
     let effectiveLanguage = language;
     let patientContext = '';
 
-    // Pre-feed AI with known patient data (v2 enhancement)
-    if (session.turnCount === 0) {
-        try {
-            const consultDoc = await collections.consultations.doc(consultationId).get();
-            const patientId = consultDoc.data()?.patientId;
-            if (patientId) {
-                const profile = identifiedProfile || (await collections.patients.doc(patientId).get()).data();
-                if (profile) {
-                    // Auto-detect language from patient profile (if frontend didn't override)
-                    if ((!language || language === 'en') && profile.preferredLanguage && profile.preferredLanguage !== 'en') {
-                        effectiveLanguage = profile.preferredLanguage;
-                    }
+    // Pre-feed AI with known patient data across all turns
+    try {
+        const patientId = session.patientId || (await collections.consultations.doc(consultationId).get()).data()?.patientId;
+        if (patientId) {
+            const profile = identifiedProfile || (await collections.patients.doc(patientId).get()).data();
+            if (profile) {
+                // Auto-detect language from patient profile (if frontend didn't override)
+                if ((!effectiveLanguage || effectiveLanguage === 'en') && profile.preferredLanguage && profile.preferredLanguage !== 'en') {
+                    effectiveLanguage = profile.preferredLanguage;
+                }
 
-                    const parts: string[] = [];
-                    const age = computeAgeFromDob(profile.profile?.dateOfBirth);
-                    if (age !== null) parts.push(`Age: ${age} years`);
-                    if (profile.knownMedications?.length) parts.push(`Current Medications: ${profile.knownMedications.join(', ')}`);
-                    if (profile.knownAllergies?.length) parts.push(`Known Allergies: ${profile.knownAllergies.join(', ')}`);
-                    if (profile.pastConditions?.length) parts.push(`Past Medical History: ${profile.pastConditions.join(', ')}`);
-                    if (profile.bloodType) parts.push(`Blood Type: ${profile.bloodType}`);
-                    if (parts.length > 0) {
-                        patientContext = `\n\nKNOWN PATIENT DATA (from prior visits):\n${parts.join('\n')}\n\nDO NOT re-ask about items listed above. Instead, confirm: "I see from your records that you take [meds] and are allergic to [allergies] — has anything changed since your last visit?" Then proceed to the chief complaint.`;
-                    }
+                const parts: string[] = [];
+                const age = computeAgeFromDob(profile.profile?.dateOfBirth);
+                if (age !== null) parts.push(`Age: ${age} years`);
+
+                const lh = profile.longitudinalHistory || {};
+                const mr = profile.medicalRecord || {};
+
+                const meds = profile.knownMedications?.length ? profile.knownMedications
+                    : profile.currentMedications?.length ? profile.currentMedications
+                    : lh.medications ? [lh.medications]
+                    : mr.medications?.length ? mr.medications : [];
+                if (meds.length) parts.push(`Current Medications: ${Array.isArray(meds) ? meds.join(', ') : meds}`);
+
+                const allergies = profile.knownAllergies?.length ? profile.knownAllergies
+                    : profile.allergies?.length ? profile.allergies
+                    : lh.allergies ? [lh.allergies]
+                    : mr.allergies?.length ? mr.allergies : [];
+                if (allergies.length) parts.push(`Known Allergies: ${Array.isArray(allergies) ? allergies.join(', ') : allergies}`);
+
+                const pmh = profile.pastConditions?.length ? profile.pastConditions
+                    : profile.chronicConditions?.length ? profile.chronicConditions
+                    : lh.pastMedical ? [lh.pastMedical]
+                    : mr.conditions?.length ? mr.conditions : [];
+                if (pmh.length) parts.push(`Past Medical History: ${Array.isArray(pmh) ? pmh.join(', ') : pmh}`);
+
+                const psh = profile.pastSurgical?.length ? profile.pastSurgical
+                    : lh.pastSurgical ? [lh.pastSurgical]
+                    : mr.surgeries?.length ? mr.surgeries : [];
+                if (psh.length) parts.push(`Past Surgical History: ${Array.isArray(psh) ? psh.join(', ') : psh}`);
+
+                const fam = profile.familyHistory?.length ? profile.familyHistory
+                    : lh.familyHistory ? [lh.familyHistory]
+                    : mr.familyHistory?.length ? mr.familyHistory : [];
+                if (fam.length) parts.push(`Family History: ${Array.isArray(fam) ? fam.join(', ') : fam}`);
+
+                const soc = lh.socialHistory || (typeof profile.socialHistory === 'object' ? JSON.stringify(profile.socialHistory) : profile.socialHistory) || mr.socialHistory;
+                if (soc) parts.push(`Social History: ${typeof soc === 'object' ? JSON.stringify(soc) : soc}`);
+
+                if (profile.bloodType) parts.push(`Blood Type: ${profile.bloodType}`);
+                if (parts.length > 0) {
+                    patientContext = `\n\nKNOWN PATIENT DATA (from prior visits & profile record):\n${parts.join('\n')}\n\nDO NOT re-ask about static history items (Past Medical, Past Surgical, Family, Social) listed above — they are ALREADY ON FILE and COMPLETE. For safety items (medications and allergies), confirm with ONE short question if not already confirmed.`;
                 }
             }
-        } catch (e) {
-            log.warn('Failed to fetch patient profile for context:', e);
         }
+    } catch (e) {
+        log.warn('Failed to fetch patient profile for context:', e);
     }
 
     if (session.historyState.presentingComplaint) {
@@ -845,7 +1061,8 @@ export async function conductIntake(
     const steeringNote = buildSteeringNote(
         session.historyState, preTurnCompleteness, session.turnCount, MAX_TURNS, flagScan.suspected
     );
-    const systemContent = INTAKE_SYSTEM_PROMPT + situationAddendums + langAddendum + patientContext + carryOverAddendum + steeringNote;
+    const adaptiveLanguageNote = buildAdaptiveLanguageNote(sanitizedMessage, session.messages);
+    const systemContent = INTAKE_SYSTEM_PROMPT + situationAddendums + langAddendum + patientContext + carryOverAddendum + adaptiveLanguageNote + steeringNote;
 
     // M5: wrap the patient's current turn in untrusted-data delimiters so the
     // model treats it as information to analyze, never as instructions. The
@@ -904,6 +1121,9 @@ export async function conductIntake(
     // ── Merge the model's structured extraction into HistoryState
     let historyState = session.historyState;
     if (result.extraction) {
+        if ((result as any).confirmations && !result.extraction.confirmations) {
+            result.extraction.confirmations = (result as any).confirmations;
+        }
         historyState = mergeExtraction(historyState, result.extraction);
     }
     const completeness = computeCompleteness(historyState);
@@ -936,8 +1156,16 @@ export async function conductIntake(
     );
 
     // ── Completeness governs completion: never end mid-history unless the
-    //    hard cap is reached or an emergency was flagged.
-    if (result.isComplete && !result.emergencyDetected && !completeness.complete && session.turnCount + 1 < MAX_TURNS) {
+    //    hard cap is reached, an emergency was flagged, or the clinical presentation
+    //    is adequate for differential diagnosis.
+    const hasCoreHpi = !!(
+        historyState.presentingComplaint &&
+        (historyState.hpi.onset || historyState.hpi.duration || historyState.hpi.severity || historyState.hpi.characteristics)
+    );
+    const safetyPending = unconfirmedCarriedDomains(historyState).filter(d => (SAFETY_CARRY_DOMAINS as readonly string[]).includes(d));
+    const isAdequateForDDx = hasCoreHpi && safetyPending.length === 0 && (completeness.percent >= 70 || session.turnCount >= 6);
+
+    if (result.isComplete && !result.emergencyDetected && !completeness.complete && !isAdequateForDDx && session.turnCount + 1 < MAX_TURNS) {
         log.info(`Intake ${consultationId}: model set isComplete with missing domains [${completeness.missing.join(', ')}] — overriding to continue`);
         result.isComplete = false;
     }
@@ -954,7 +1182,7 @@ export async function conductIntake(
     await saveIntakeSession(
         consultationId, updatedMessages, newTurnCount, result.isComplete,
         historyState, redFlags, session.emergencyDetected || result.emergencyDetected,
-        triage ?? null
+        triage ?? null, session.patientId
     );
 
     // ── Queue routing: persist the disposition on the consultation doc (additive fields).
@@ -977,12 +1205,61 @@ export async function conductIntake(
         // `intake_pending` to `waiting` so doctors see the patient now (and the
         // SLA clock starts). Guest sessions have no consultation yet — no-op.
         try {
-            await collections.consultations.doc(consultationId).update({
+            const consultRef = collections.consultations.doc(consultationId);
+            const consultSnap = await consultRef.get();
+            const consultData = consultSnap.exists ? consultSnap.data() : null;
+            await consultRef.update({
                 intakeCompleted: true,
+                awaitingIntake: false,
                 intakeCompletedAt: new Date(),
                 status: 'intake_complete',
             });
             await markQueueEntryIntakeComplete(consultationId);
+
+            // Phase 2 Notification ("Patient Ready to Claim — History Complete"):
+            // If doctor notification was deferred until AI intake completed, dispatch now
+            // to both facility/platform staff AND active/on-schedule doctors with a
+            // direct deep-link (/consultations/:id) so they can tap and join immediately.
+            if (consultData?.awaitingIntake === true && !consultData?.doctorId && !options.isSandbox) {
+                const targetFacilityId = partnerSiteIdOf(consultData.facilityId) || null;
+                const spec = consultData.specialtyId || 'general';
+                const phase2Roles: any[] = targetFacilityId
+                    ? ['doctor', 'hospital_admin', 'clinic_admin', 'admin']
+                    : ['doctor', 'admin', 'super_admin'];
+                notificationService.sendToFacilityStaff?.(
+                    targetFacilityId,
+                    phase2Roles,
+                    '✅ Patient Ready to Claim — History Complete',
+                    `A patient has completed history check-in and is waiting for a ${spec} consultation. Tap to claim and enter the chat.`,
+                    {
+                        consultationId,
+                        type: 'new_consultation',
+                        phase: 'ready_to_claim',
+                        url: `/consultations/${consultationId}`,
+                    },
+                )?.catch?.(() => { });
+
+                void (async () => {
+                    try {
+                        const onDuty = await resolveOnDutyDoctors(targetFacilityId || CENTRAL_SCOPE, { fallbackLimit: 10 });
+                        const targetDoctorIds = new Set<string>(onDuty.doctorIds || []);
+                        if (consultData.suggestedDoctorId) targetDoctorIds.add(consultData.suggestedDoctorId);
+                        for (const docId of targetDoctorIds) {
+                            await notificationService.sendToUser(
+                                docId,
+                                '✅ Patient Ready to Claim — History Complete',
+                                `A patient has completed history check-in for a ${spec} consultation — tap to claim and join the conversation now.`,
+                                {
+                                    consultationId,
+                                    type: docId === consultData.suggestedDoctorId ? 'consultation_suggested' : 'new_consultation',
+                                    phase: 'ready_to_claim',
+                                    url: `/consultations/${consultationId}`,
+                                },
+                            ).catch(() => { });
+                        }
+                    } catch { /* best-effort phase-2 on-duty notification */ }
+                })();
+            }
         } catch (e) {
             log.warn('Failed to update consultation status:', e);
         }
