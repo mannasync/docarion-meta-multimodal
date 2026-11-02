@@ -12,7 +12,7 @@
 - **Dr. Godswill Olemgbe, MBBS** — Founder & CEO ([@evidencechecked](https://x.com/evidencechecked))
 - **Dr. Ayotomiwa Ayilola, MBBS** — Co-Founder & CMO ([@silverpenydr](https://x.com/silverpenydr))
 - **Yusuf Alani Olayode** — Co-Founder & CTO ([@Doctware](https://x.com/Doctware))
-- **C. Kunnuji** — Founding Engineering & Operations ([@KunnujiC](https://x.com/KunnujiC))
+- **C. Kunnuji** — Co-Founder ([@KunnujiC](https://x.com/KunnujiC))
 - **Official Brand & Pilot/Angel Partner Inquiries:** [@docarion_hq](https://x.com/docarion_hq) · [https://docarion.com](https://docarion.com)
 
 ---
