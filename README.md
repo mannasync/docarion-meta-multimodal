@@ -12,7 +12,7 @@
 - **Dr. Godswill Olemgbe, MBBS** — Founder & CEO ([@evidencechecked](https://x.com/evidencechecked))
 - **Dr. Ayotomiwa Ayilola, MBBS** — Co-Founder & CMO ([@silverpenydr](https://x.com/silverpenydr))
 - **Yusuf Alani Olayode** — Co-Founder & CTO ([@Doctware](https://x.com/Doctware))
-- **Divya** — Co-Founder & Docarion Central Admin ([@KunnujiC](https://x.com/KunnujiC)) — Leads Docarion Central Command, `<10-minute` SLA queue dispatch, assisted patient phone-desk scheduling, and facility network administration.
+- **Divya** — Head of Docarion Central Admin & Operations (Founding Team) ([@KunnujiC](https://x.com/KunnujiC)) — Leads Docarion Central Command, `<10-minute` SLA queue dispatch, assisted patient phone-desk scheduling, and facility network administration.
 - **Official Brand & Pilot/Angel Partner Inquiries:** [@docarion_hq](https://x.com/docarion_hq) · [https://docarion.com](https://docarion.com)
 
 ---
