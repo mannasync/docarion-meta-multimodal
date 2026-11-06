@@ -66,12 +66,11 @@ To test any of the 10 clinical, pharmacy, community medicine store (PPMV), lab, 
 
 ---
 
-## 👨‍⚕️ Hackathon Builder & Startup Attribution Disclosure (`Team #468 — Docarion`)
+## 👨‍⚕️ Hackathon Builder & Solo Contributor Disclosure (`Team #468 — Docarion`)
 
-- **Approved Hackathon Participant & Solo Hackathon Builder (100%):** **Dr. Godswill Olemgbe, MBBS** — Founder & CEO ([@evidencechecked](https://x.com/evidencechecked) · Cerebral Valley: `dr_gee`).
-  - **100% Solo Hackathon Build:** Every line of the Meta AI Hackathon integration—including the **Meta Muse Spark & Muse Wonder** clinical intelligence engine, **Hypothesis-Driven AI History-Taking (HDHT)** & longitudinal fixed-history intake, **Meta SAM 3.1** clinical vision & NAFDAC/PCN gatekeeper, **Meta MMS-1B** 2-way call audio diarization, and the **In-Consultation Clinical Co-Pilot & Unified SOAP workflow**—was architected and built 100% solo by Dr. Godswill Olemgbe during the hackathon.
-- **Pre-Existing Startup Organization Note (Video & X Post Context):** Other individuals referenced in our startup overview video or X post (*Dr. Ayotomiwa Ayilola [@silverpenydr](https://x.com/silverpenydr), Yusuf Alani Olayode [@Doctware](https://x.com/Doctware), and Divya [@KunnujiC](https://x.com/KunnujiC)*) are part of the broader pre-existing Docarion startup organization (with our viral X post shared on behalf of Docarion via `@silverpenydr` and `@evidencechecked`); they are not hackathon participants and did not build or contribute code to this Hackathon integration.
-- **Official Brand & Pilot/Angel Partner Inquiries:** [@docarion_hq](https://x.com/docarion_hq) · [https://docarion.com](https://docarion.com)
+- **Approved Hackathon Participant & 100% Solo Hackathon Builder:** **Dr. Godswill Olemgbe, MBBS** — Founder & CEO ([@evidencechecked](https://x.com/evidencechecked) · Cerebral Valley: `dr_gee`).
+- **100% Solo Hackathon Build (Rule 7 Compliance):** This entire Meta Global AI Developer Hackathon project—including 100% of the **Meta Muse Spark & Muse Wonder** clinical intelligence engine, **Hypothesis-Driven AI History-Taking (HDHT)** & longitudinal fixed-history intake, **Meta SAM 3.1** clinical vision & NAFDAC/PCN gatekeeper, **Meta MMS-1B** 2-way call audio diarization, and the **In-Consultation Clinical Co-Pilot & Unified SOAP workflow**—was architected, coded, and built **100% solo by Dr. Godswill Olemgbe** as the sole approved hackathon participant on this submission. No other individuals or company team members contributed to or worked on this hackathon segment.
+- **Official Brand & Waitlist Portal:** [@docarion_hq](https://x.com/docarion_hq) · [https://docarion.com](https://docarion.com)
 
 ---
 
